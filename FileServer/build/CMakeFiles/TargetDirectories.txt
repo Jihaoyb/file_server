@@ -1,0 +1,3 @@
+C:/Users/yejih/vcpkg/FileServer/build/CMakeFiles/FileServer.dir
+C:/Users/yejih/vcpkg/FileServer/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/yejih/vcpkg/FileServer/build/CMakeFiles/ZERO_CHECK.dir
