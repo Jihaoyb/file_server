@@ -1,0 +1,82 @@
+{
+    "name": "file-server",
+    "version": "1.0.0",
+    "description": "A high-performance personal file server built with C++ and Poco framework",
+    "homepage": "https://github.com/yourusername/file_server",
+    "documentation": "https://github.com/yourusername/file_server/wiki",
+    "supports": "windows & linux & osx",
+    "dependencies": [
+        {
+            "name": "poco",
+            "features": [
+                "netssl",
+                "data-sqlite",
+                "json"
+            ]
+        },
+        {
+            "name": "openssl"
+        },
+        {
+            "name": "gtest",
+            "$comment": "Required for unit testing"
+        },
+        {
+            "name": "fmt",
+            "$comment": "Modern C++ string formatting library"
+        },
+        {
+            "name": "spdlog",
+            "$comment": "Fast C++ logging library"
+        }
+    ],
+    "features": {
+        "tests": {
+            "description": "Build with testing support",
+            "dependencies": [
+                {
+                    "name": "gtest"
+                }
+            ]
+        },
+        "benchmarks": {
+            "description": "Build with benchmarking support", 
+            "dependencies": [
+                {
+                    "name": "benchmark"
+                }
+            ]
+        },
+        "cloud-storage": {
+            "description": "Enable cloud storage backends (AWS S3, Azure)",
+            "dependencies": [
+                {
+                    "name": "aws-sdk-cpp",
+                    "features": ["s3"]
+                },
+                {
+                    "name": "azure-storage-cpp"
+                }
+            ]
+        },
+        "database-postgresql": {
+            "description": "Enable PostgreSQL database support",
+            "dependencies": [
+                {
+                    "name": "poco",
+                    "features": ["data-postgresql"]
+                }
+            ]
+        },
+        "database-mysql": {
+            "description": "Enable MySQL database support", 
+            "dependencies": [
+                {
+                    "name": "poco",
+                    "features": ["data-mysql"]
+                }
+            ]
+        }
+    },
+    "builtin-baseline": "2024.08.23"
+}

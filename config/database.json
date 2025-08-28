@@ -1,0 +1,90 @@
+{
+    "database": {
+        "sqlite": {
+            "path": "data/fileserver.db",
+            "pragma": {
+                "journal_mode": "WAL",
+                "synchronous": "NORMAL",
+                "cache_size": 10000,
+                "temp_store": "memory",
+                "mmap_size": 268435456
+            },
+            "pool": {
+                "min_connections": 1,
+                "max_connections": 20,
+                "timeout": 5000
+            },
+            "backup": {
+                "enabled": true,
+                "interval_hours": 24,
+                "retention_days": 7,
+                "backup_path": "data/backups"
+            }
+        },
+        "postgresql": {
+            "host": "localhost",
+            "port": 5432,
+            "database": "fileserver",
+            "username": "fileserver_user",
+            "password": "your_password_here",
+            "ssl_mode": "prefer",
+            "pool": {
+                "min_connections": 2,
+                "max_connections": 50,
+                "timeout": 10000,
+                "idle_timeout": 300000
+            },
+            "connection_string": "postgresql://fileserver_user:password@localhost:5432/fileserver"
+        },
+        "mysql": {
+            "host": "localhost",
+            "port": 3306,
+            "database": "fileserver",
+            "username": "fileserver_user",
+            "password": "your_password_here",
+            "charset": "utf8mb4",
+            "pool": {
+                "min_connections": 2,
+                "max_connections": 50,
+                "timeout": 10000,
+                "idle_timeout": 300000
+            },
+            "connection_string": "mysql://fileserver_user:password@localhost:3306/fileserver"
+        }
+    },
+    "migrations": {
+        "enabled": true,
+        "path": "sql/migrations",
+        "auto_migrate": true,
+        "create_tables": true
+    },
+    "schema": {
+        "version": "1.0",
+        "tables": [
+            {
+                "name": "users",
+                "description": "User accounts and authentication data"
+            },
+            {
+                "name": "files",
+                "description": "File metadata and storage information"
+            },
+            {
+                "name": "file_versions",
+                "description": "File version history"
+            },
+            {
+                "name": "shares",
+                "description": "File sharing permissions and links"
+            },
+            {
+                "name": "sessions",
+                "description": "User session and JWT token management"
+            },
+            {
+                "name": "audit_logs",
+                "description": "Security and activity audit logs"
+            }
+        ]
+    }
+}
