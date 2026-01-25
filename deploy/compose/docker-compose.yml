@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  nebulafs:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../data:/app/data
+    command: ["./nebulafs", "--config", "config/server.json"]
