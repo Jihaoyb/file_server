@@ -47,7 +47,8 @@ target_link_libraries(nebulafs_core
 target_compile_definitions(nebulafs_core PUBLIC POCO_STATIC)
 
 if(MSVC)
-    target_compile_options(nebulafs_core PRIVATE /W4 /permissive-)
+    add_compile_definitions(_WIN32_WINNT=0x0601)
+    target_compile_options(nebulafs_core PRIVATE /W4 /permissive- /bigobj)
 else()
     target_compile_options(nebulafs_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()

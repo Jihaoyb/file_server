@@ -87,8 +87,8 @@ std::filesystem::path WriteServerConfig(const std::filesystem::path& dir,
         << "    }\n"
         << "  },\n"
         << "  \"storage\": {\n"
-        << "    \"base_path\": \"" << storage_dir.string() << "\",\n"
-        << "    \"temp_path\": \"" << temp_dir.string() << "\"\n"
+        << "    \"base_path\": \"" << storage_dir.generic_string() << "\",\n"
+        << "    \"temp_path\": \"" << temp_dir.generic_string() << "\"\n"
         << "  },\n"
         << "  \"observability\": {\n"
         << "    \"log_level\": \"warning\"\n"
@@ -103,7 +103,7 @@ std::filesystem::path WriteDatabaseConfig(const std::filesystem::path& dir) {
     std::ofstream out(config_path);
     out << "{\n"
         << "  \"sqlite\": {\n"
-        << "    \"path\": \"" << db_path.string() << "\"\n"
+        << "    \"path\": \"" << db_path.generic_string() << "\"\n"
         << "  }\n"
         << "}\n";
     return config_path;
