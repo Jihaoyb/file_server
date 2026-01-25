@@ -15,11 +15,18 @@ jobs:
       - name: Install Ninja (Windows)
         if: runner.os == 'Windows'
         run: choco install ninja
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Install vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: 01e159b519b7e791cc5bb3548663a26d9c0922a3
-      - name: Configure
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --preset debug -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
         run: cmake --preset debug
       - name: Build
         run: cmake --build --preset debug
