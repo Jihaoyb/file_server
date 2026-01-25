@@ -46,7 +46,11 @@ target_link_libraries(nebulafs_core
 
 target_compile_definitions(nebulafs_core PUBLIC POCO_STATIC)
 
-target_compile_options(nebulafs_core PRIVATE -Wall -Wextra -Wpedantic)
+if(MSVC)
+    target_compile_options(nebulafs_core PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(nebulafs_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 add_executable(nebulafs
     src/main.cpp
