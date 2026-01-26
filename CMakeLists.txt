@@ -45,9 +45,11 @@ target_link_libraries(nebulafs_core
 )
 
 target_compile_definitions(nebulafs_core PUBLIC POCO_STATIC)
+if(WIN32)
+    target_compile_definitions(nebulafs_core PUBLIC _WIN32_WINNT=0x0601)
+endif()
 
-if(MSVC)
-    add_compile_definitions(_WIN32_WINNT=0x0601)
+if(MSVC OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND WIN32))
     target_compile_options(nebulafs_core PRIVATE /W4 /permissive- /bigobj)
 else()
     target_compile_options(nebulafs_core PRIVATE -Wall -Wextra -Wpedantic)

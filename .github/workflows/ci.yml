@@ -10,6 +10,8 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
     steps:
       - uses: actions/checkout@v4
       - name: Install Ninja (Windows)
@@ -18,6 +20,12 @@ jobs:
       - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}
+          restore-keys: ${{ runner.os }}-vcpkg-
       - name: Install vcpkg
         uses: lukka/run-vcpkg@v11
         with:
