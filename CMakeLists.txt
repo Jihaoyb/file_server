@@ -44,7 +44,9 @@ target_link_libraries(nebulafs_core
         Poco::NetSSL
 )
 
-target_compile_definitions(nebulafs_core PUBLIC POCO_STATIC)
+if(DEFINED VCPKG_TARGET_TRIPLET AND VCPKG_TARGET_TRIPLET MATCHES "-static")
+    target_compile_definitions(nebulafs_core PUBLIC POCO_STATIC)
+endif()
 if(WIN32)
     target_compile_definitions(nebulafs_core PUBLIC _WIN32_WINNT=0x0601)
 endif()
