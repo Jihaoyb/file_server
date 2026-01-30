@@ -31,9 +31,13 @@ public:
     explicit ServerProcess(Poco::ProcessHandle handle) : handle_(std::move(handle)) {}
 
     ~ServerProcess() {
-        if (Poco::Process::isRunning(handle_)) {
-            Poco::Process::kill(handle_);
-            Poco::Process::wait(handle_);
+        try {
+            if (Poco::Process::isRunning(handle_)) {
+                Poco::Process::kill(handle_);
+                Poco::Process::wait(handle_);
+            }
+        } catch (const std::exception&) {
+            // Best-effort shutdown; test cleanup should not throw.
         }
     }
 
@@ -62,6 +66,17 @@ std::filesystem::path MakeTempDir() {
     auto dir = base / name;
     std::filesystem::create_directories(dir);
     return dir;
+}
+
+void CleanupTempDir(const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (int i = 0; i < 5; ++i) {
+        std::filesystem::remove_all(dir, ec);
+        if (!ec) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 std::filesystem::path WriteServerConfig(const std::filesystem::path& dir,
@@ -215,5 +230,5 @@ TEST(IntegrationHttp, BasicCrudSmoke) {
         EXPECT_EQ(missing.result(), http::status::not_found);
     }
 
-    std::filesystem::remove_all(temp_dir);
+    CleanupTempDir(temp_dir);
 }
