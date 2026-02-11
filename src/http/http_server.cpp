@@ -1,6 +1,7 @@
 #include "nebulafs/http/http_server.h"
 
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +27,8 @@
 #include "nebulafs/core/ids.h"
 #include "nebulafs/core/logger.h"
 #include "nebulafs/observability/metrics.h"
+#include "nebulafs/auth/jwt_utils.h"
+#include "nebulafs/auth/jwt_verifier.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -129,12 +132,14 @@ class Session : public std::enable_shared_from_this<Session<Stream>> {
 public:
     Session(Stream&& stream, nebulafs::http::Router router, nebulafs::core::Config config,
             std::shared_ptr<nebulafs::storage::LocalStorage> storage,
-            std::shared_ptr<nebulafs::metadata::MetadataStore> metadata)
+            std::shared_ptr<nebulafs::metadata::MetadataStore> metadata,
+            std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier)
         : stream_(std::move(stream)),
           router_(std::move(router)),
           config_(std::move(config)),
           storage_(std::move(storage)),
-          metadata_(std::move(metadata)) {
+          metadata_(std::move(metadata)),
+          auth_verifier_(std::move(auth_verifier)) {
     }
 
     void Start() {
@@ -175,6 +180,8 @@ private:
         }
 
         request_id_ = nebulafs::core::GenerateRequestId();
+        // Clear any previous request state for reused sessions.
+        auth_claims_.reset();
         request_start_ = std::chrono::steady_clock::now();
         request_method_ = std::string(parser_->get().method_string());
         request_target_ = std::string(parser_->get().target());
@@ -182,6 +189,12 @@ private:
         const auto target = request_target_;
         const auto path = StripQuery(target);
         const auto method = parser_->get().method();
+
+        // Enforce auth early to avoid streaming uploads for unauthorized requests.
+        auto auth_response = EnsureAuthorized(parser_->get(), path);
+        if (auth_response) {
+            return Send(std::move(*auth_response));
+        }
 
         // Fast-path: stream uploads directly to disk to avoid buffering large bodies.
         if (method == http::verb::put && IsObjectPath(path)) {
@@ -257,9 +270,18 @@ private:
         ctx.method = std::string(request.method_string());
         ctx.target = std::string(request.target());
         ctx.remote = request_remote_;
+        if (auth_claims_) {
+            ctx.auth = nebulafs::http::AuthContext{auth_claims_->subject, auth_claims_->issuer,
+                                                   auth_claims_->audience, auth_claims_->scopes};
+        }
 
         const auto target = std::string(request.target());
         const auto path = StripQuery(target);
+        // Enforce auth for non-upload requests.
+        auto auth_response = EnsureAuthorized(request, path);
+        if (auth_response) {
+            return Send(std::move(*auth_response));
+        }
         if (request.method() == http::verb::get && IsObjectPath(path)) {
             return HandleDownload(request, path);
         }
@@ -277,6 +299,54 @@ private:
         nebulafs::http::RouteParams params;
         return nebulafs::http::Router::Match("/v1/buckets/{bucket}/objects/{object}", path,
                                              &params);
+    }
+
+    bool IsPublicPath(const std::string& path) const {
+        // Keep health endpoints public for liveness checks.
+        return path == "/healthz" || path == "/readyz";
+    }
+
+    template <typename Request>
+    std::optional<std::string> ExtractBearerToken(const Request& request) {
+        // Expect "Authorization: Bearer <token>".
+        auto it = request.find(http::field::authorization);
+        if (it == request.end()) {
+            return std::nullopt;
+        }
+        // Convert header value from Beast string_view in a portable way.
+        std::string value = nebulafs::auth::Trim(std::string(it->value()));
+        if (value.size() < 7) {
+            return std::nullopt;
+        }
+        std::string prefix = value.substr(0, 7);
+        for (auto& c : prefix) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (prefix != "bearer ") {
+            return std::nullopt;
+        }
+        return nebulafs::auth::Trim(value.substr(7));
+    }
+
+    template <typename Request>
+    std::optional<http::response<http::string_body>> EnsureAuthorized(const Request& request,
+                                                                      const std::string& path) {
+        // Skip auth when disabled or for public endpoints.
+        if (!config_.auth.enabled || IsPublicPath(path)) {
+            return std::nullopt;
+        }
+        auto token = ExtractBearerToken(request);
+        if (!token || token->empty()) {
+            return ErrorResponse(http::status::unauthorized, request.version(), "UNAUTHORIZED",
+                                 "missing bearer token", request_id_);
+        }
+        auto result = auth_verifier_->Verify(*token);
+        if (!result.ok()) {
+            return ErrorResponse(http::status::unauthorized, request.version(), "UNAUTHORIZED",
+                                 result.error().message, request_id_);
+        }
+        auth_claims_ = result.value();
+        return std::nullopt;
     }
 
     void StartUpload(const std::string& path) {
@@ -524,6 +594,7 @@ private:
     nebulafs::core::Config config_;
     std::shared_ptr<nebulafs::storage::LocalStorage> storage_;
     std::shared_ptr<nebulafs::metadata::MetadataStore> metadata_;
+    std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier_;
 
     std::string request_id_;
     std::string request_method_;
@@ -531,6 +602,7 @@ private:
     std::string request_remote_;
     std::chrono::steady_clock::time_point request_start_{};
     std::string body_;
+    std::optional<nebulafs::auth::JwtClaims> auth_claims_;
 
     std::string upload_bucket_;
     std::string upload_object_;
@@ -550,12 +622,14 @@ public:
              nebulafs::core::Config config,
              std::shared_ptr<nebulafs::storage::LocalStorage> storage,
              std::shared_ptr<nebulafs::metadata::MetadataStore> metadata,
+             std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier,
              net::ssl::context* ssl_ctx)
         : acceptor_(ioc),
           router_(std::move(router)),
           config_(std::move(config)),
           storage_(std::move(storage)),
           metadata_(std::move(metadata)),
+          auth_verifier_(std::move(auth_verifier)),
           ssl_ctx_(ssl_ctx) {
         beast::error_code ec;
         acceptor_.open(endpoint.protocol(), ec);
@@ -579,12 +653,12 @@ private:
             if (ssl_ctx_) {
                 auto stream = beast::ssl_stream<beast::tcp_stream>(std::move(socket), *ssl_ctx_);
                 std::make_shared<Session<beast::ssl_stream<beast::tcp_stream>>>(
-                    std::move(stream), router_, config_, storage_, metadata_)
+                    std::move(stream), router_, config_, storage_, metadata_, auth_verifier_)
                     ->Start();
             } else {
                 auto stream = beast::tcp_stream(std::move(socket));
                 std::make_shared<Session<beast::tcp_stream>>(std::move(stream), router_, config_,
-                                                             storage_, metadata_)
+                                                             storage_, metadata_, auth_verifier_)
                     ->Start();
             }
         }
@@ -596,6 +670,7 @@ private:
     nebulafs::core::Config config_;
     std::shared_ptr<nebulafs::storage::LocalStorage> storage_;
     std::shared_ptr<nebulafs::metadata::MetadataStore> metadata_;
+    std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier_;
     net::ssl::context* ssl_ctx_{nullptr};
 };
 
@@ -611,6 +686,7 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, const core::Config& config,
       router_(std::move(router)),
       storage_(std::move(storage)),
       metadata_(std::move(metadata)) {
+    auth_verifier_ = std::make_shared<nebulafs::auth::JwtVerifier>(config_.auth);
     if (config_.server.tls.enabled) {
         ssl_context_ = std::make_unique<net::ssl::context>(net::ssl::context::tlsv12_server);
         ssl_context_->use_certificate_chain_file(config_.server.tls.certificate);
@@ -623,6 +699,7 @@ void HttpServer::Run() {
     const tcp::endpoint endpoint{address, static_cast<unsigned short>(config_.server.port)};
 
     std::make_shared<Listener>(ioc_, endpoint, router_, config_, storage_, metadata_,
+                               auth_verifier_,
                                ssl_context_ ? ssl_context_.get() : nullptr)
         ->Run();
 }

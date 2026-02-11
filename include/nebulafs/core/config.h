@@ -37,11 +37,23 @@ struct ObservabilityConfig {
     std::string log_level{"information"};
 };
 
+/// @brief Auth settings for OIDC/JWT validation.
+struct AuthConfig {
+    bool enabled{false};
+    std::string issuer;
+    std::string audience;
+    std::string jwks_url;
+    int cache_ttl_seconds{300};
+    int clock_skew_seconds{60};
+    std::string allowed_alg{"RS256"};
+};
+
 /// @brief Top-level configuration for NebulaFS.
 struct Config {
     ServerConfig server;
     StorageConfig storage;
     ObservabilityConfig observability;
+    AuthConfig auth;
 };
 
 /// @brief Load server configuration from a JSON file.

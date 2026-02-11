@@ -24,6 +24,14 @@ Config LoadConfig(const std::string& path) {
     config.storage.temp_path = cfg->getString("storage.temp_path", "data/tmp");
 
     config.observability.log_level = cfg->getString("observability.log_level", "information");
+
+    config.auth.enabled = cfg->getBool("auth.enabled", false);
+    config.auth.issuer = cfg->getString("auth.issuer", "");
+    config.auth.audience = cfg->getString("auth.audience", "");
+    config.auth.jwks_url = cfg->getString("auth.jwks_url", "");
+    config.auth.cache_ttl_seconds = cfg->getInt("auth.cache_ttl_seconds", 300);
+    config.auth.clock_skew_seconds = cfg->getInt("auth.clock_skew_seconds", 60);
+    config.auth.allowed_alg = cfg->getString("auth.allowed_alg", "RS256");
     return config;
 }
 

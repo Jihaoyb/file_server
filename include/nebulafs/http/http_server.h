@@ -7,6 +7,7 @@
 #include <boost/asio/ssl/context.hpp>
 
 #include "nebulafs/core/config.h"
+#include "nebulafs/auth/jwt_verifier.h"
 #include "nebulafs/http/router.h"
 #include "nebulafs/metadata/metadata_store.h"
 #include "nebulafs/storage/local_storage.h"
@@ -27,6 +28,7 @@ private:
     Router router_;
     std::shared_ptr<storage::LocalStorage> storage_;
     std::shared_ptr<metadata::MetadataStore> metadata_;
+    std::shared_ptr<auth::JwtVerifier> auth_verifier_;
     std::unique_ptr<boost::asio::ssl::context> ssl_context_;
 };
 

@@ -12,6 +12,9 @@ find_package(OpenSSL REQUIRED)
 find_package(Poco REQUIRED COMPONENTS Foundation Util JSON Crypto Data DataSQLite Net NetSSL)
 
 add_library(nebulafs_core
+    src/auth/jwks_cache.cpp
+    src/auth/jwt_utils.cpp
+    src/auth/jwt_verifier.cpp
     src/core/config.cpp
     src/core/logger.cpp
     src/core/result.cpp
@@ -44,10 +47,15 @@ target_link_libraries(nebulafs_core
         Poco::NetSSL
 )
 
-target_compile_definitions(nebulafs_core PUBLIC POCO_STATIC)
+if(DEFINED VCPKG_TARGET_TRIPLET AND VCPKG_TARGET_TRIPLET MATCHES "-static")
+    target_compile_definitions(nebulafs_core PUBLIC POCO_STATIC)
+endif()
+if(WIN32)
+    target_compile_definitions(nebulafs_core PUBLIC _WIN32_WINNT=0x0601)
+endif()
 
-if(MSVC)
-    target_compile_options(nebulafs_core PRIVATE /W4 /permissive-)
+if(MSVC OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND WIN32))
+    target_compile_options(nebulafs_core PRIVATE /W4 /permissive- /bigobj)
 else()
     target_compile_options(nebulafs_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
@@ -65,6 +73,7 @@ if(NEBULAFS_ENABLE_TESTS)
     add_executable(nebulafs_unit_tests
         tests/unit/test_path_safety.cpp
         tests/unit/test_metadata_store.cpp
+        tests/unit/test_jwt_verifier.cpp
     )
     target_link_libraries(nebulafs_unit_tests PRIVATE nebulafs_core GTest::gtest GTest::gtest_main)
     add_test(NAME nebulafs_unit_tests COMMAND nebulafs_unit_tests)

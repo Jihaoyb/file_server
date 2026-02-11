@@ -18,5 +18,14 @@
   },
   "observability": {
     "log_level": "information"
+  },
+  "auth": {
+    "enabled": true,
+    "issuer": "http://127.0.0.1:8081/realms/master",
+    "audience": "",
+    "jwks_url": "http://127.0.0.1:8081/realms/master/protocol/openid-connect/certs",
+    "cache_ttl_seconds": 300,
+    "clock_skew_seconds": 60,
+    "allowed_alg": "RS256"
   }
 }
