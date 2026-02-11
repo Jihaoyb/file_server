@@ -205,6 +205,18 @@ std::filesystem::path WriteJwksFile(const std::filesystem::path& dir, const std:
     return jwks_path;
 }
 
+std::string ToFileUrl(const std::filesystem::path& path) {
+    // Build a portable file URL for JWKS loading in tests.
+    const auto generic = path.generic_string();
+    if (generic.empty()) {
+        return "file://";
+    }
+    if (generic.front() == '/') {
+        return "file://" + generic;
+    }
+    return "file:///" + generic;
+}
+
 std::string SignJwt(const std::string& header, const std::string& payload, EVP_PKEY* pkey) {
     const auto message = Base64UrlEncode(header) + "." + Base64UrlEncode(payload);
 
@@ -373,7 +385,7 @@ TEST(IntegrationHttp, AuthValidation) {
     auth.enabled = true;
     auth.issuer = "https://issuer.integration.local";
     auth.audience = "nebulafs-it";
-    auth.jwks_url = "file://" + jwks_path.string();
+    auth.jwks_url = ToFileUrl(jwks_path);
     const auto config_path = WriteServerConfig(temp_dir, port, auth);
 
     std::vector<std::string> args = {"--config", config_path.string(), "--database",

@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <mutex>
+#include <cctype>
 #include <utility>
 
 #include <Poco/JSON/Array.h>
@@ -160,11 +161,16 @@ core::Result<std::string> JwksCache::FetchJwksBody() {
         return core::Error{core::ErrorCode::kUnauthorized, "jwks url missing"};
     }
 
-    Poco::URI uri(url_);
-    const auto scheme = uri.getScheme();
-
-    if (scheme == "file" || (scheme.empty() && !url_.empty() && url_.front() == '/')) {
-        const auto path = scheme == "file" ? uri.getPath() : url_;
+    // Parse file URLs manually first to avoid platform-specific URI parser edge cases.
+    if (url_.rfind("file://", 0) == 0) {
+        std::string path = url_.substr(7);
+#ifdef _WIN32
+        // Normalize file:///C:/... to C:/... for Windows filesystem APIs.
+        if (path.size() >= 3 && path[0] == '/' &&
+            std::isalpha(static_cast<unsigned char>(path[1])) && path[2] == ':') {
+            path.erase(0, 1);
+        }
+#endif
         std::ifstream in(path);
         if (!in.is_open()) {
             return core::Error{core::ErrorCode::kUnauthorized, "failed to open jwks file"};
@@ -172,6 +178,25 @@ core::Result<std::string> JwksCache::FetchJwksBody() {
         std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         return body;
     }
+
+    // Allow direct filesystem paths without file:// scheme for local tests.
+    if (!url_.empty() &&
+        (url_.front() == '/'
+#ifdef _WIN32
+         || (url_.size() >= 2 &&
+             std::isalpha(static_cast<unsigned char>(url_[0])) && url_[1] == ':')
+#endif
+        )) {
+        std::ifstream in(url_);
+        if (!in.is_open()) {
+            return core::Error{core::ErrorCode::kUnauthorized, "failed to open jwks file"};
+        }
+        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        return body;
+    }
+
+    Poco::URI uri(url_);
+    const auto scheme = uri.getScheme();
 
     const std::string host = uri.getHost();
     const std::string path = uri.getPathEtc().empty() ? "/" : uri.getPathEtc();

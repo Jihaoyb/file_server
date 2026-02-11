@@ -102,6 +102,18 @@ std::string SignJwt(const std::string& header, const std::string& payload, EVP_P
     return message + "." + sig_b64;
 }
 
+std::string ToFileUrl(const std::filesystem::path& path) {
+    // Build a portable file URL for JWKS loading in tests.
+    const auto generic = path.generic_string();
+    if (generic.empty()) {
+        return "file://";
+    }
+    if (generic.front() == '/') {
+        return "file://" + generic;
+    }
+    return "file:///" + generic;
+}
+
 }  // namespace
 
 TEST(JwtVerifier, ValidToken) {
@@ -138,7 +150,7 @@ TEST(JwtVerifier, ValidToken) {
     config.enabled = true;
     config.issuer = "issuer";
     config.audience = "aud";
-    config.jwks_url = "file://" + jwks_path.string();
+    config.jwks_url = ToFileUrl(jwks_path);
     config.allowed_alg = "RS256";
     config.cache_ttl_seconds = 300;
     config.clock_skew_seconds = 30;
