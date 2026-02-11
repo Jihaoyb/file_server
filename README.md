@@ -64,9 +64,58 @@ curl http://localhost:8080/v1/buckets/demo/objects/readme.txt -o readme.txt
 curl "http://localhost:8080/v1/buckets/demo/objects?prefix=read"
 ```
 
+### Authentication test (Keycloak local)
+
+Use this to validate `auth.enabled=true` end-to-end.
+
+1. Start Keycloak:
+```bash
+docker run --name keycloak -p 8081:8080 \
+  -e KEYCLOAK_ADMIN=admin \
+  -e KEYCLOAK_ADMIN_PASSWORD=admin \
+  quay.io/keycloak/keycloak:26.0 start-dev
+```
+
+2. Set `auth` in `config/server.json`:
+```json
+"auth": {
+  "enabled": true,
+  "issuer": "http://127.0.0.1:8081/realms/master",
+  "audience": "",
+  "jwks_url": "http://127.0.0.1:8081/realms/master/protocol/openid-connect/certs",
+  "cache_ttl_seconds": 300,
+  "clock_skew_seconds": 60,
+  "allowed_alg": "RS256"
+}
+```
+
+3. Restart NebulaFS.
+
+4. Verify protected route without token (should be `401`):
+```bash
+curl -i http://127.0.0.1:8080/v1/buckets
+```
+
+5. Request token and call protected route:
+```bash
+TOKEN=$(curl -s -X POST \
+  "http://127.0.0.1:8081/realms/master/protocol/openid-connect/token" \
+  -d "grant_type=password" \
+  -d "client_id=admin-cli" \
+  -d "username=admin" \
+  -d "password=admin" | jq -r .access_token)
+
+curl -i -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/buckets
+```
+
+Troubleshooting:
+- `issuer mismatch`: `auth.issuer` must exactly equal token `iss`.
+- `audience mismatch`: set `auth.audience` to match token `aud`, or use empty string to skip.
+- `jwks fetch failed`: verify `auth.jwks_url` and IdP reachability from NebulaFS process.
+
 ## Security Model (Current)
 - TLS supported via config; disabled by default for local dev.
-- No auth yet (Milestone 3). Health is public; all other endpoints are open in dev.
+- Auth is available via OIDC/JWT when enabled in config. Health is public; all other endpoints require a valid token.
 - Path traversal protection enforced in storage.
 - Size limits enforced by config.
 
