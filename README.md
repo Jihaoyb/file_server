@@ -8,17 +8,17 @@ NebulaFS is a production-grade, cloud-storage style file server written in C++20
 - **Local filesystem storage** with atomic writes and checksum-based ETags.
 - **SQLite metadata** for buckets and objects.
 - **Structured logging** via Poco with request correlation.
-- **Security-first** design (TLS, OIDC/JWT planned next milestone).
+- **Security-first** design with OIDC/JWT auth and JWKS validation support.
 
-## Architecture (Milestone 0–2)
+## Architecture (Milestone 0–3)
 
 ```mermaid
 flowchart LR
-  client((Client)) -->|HTTPS| gateway[HTTP Server]
-  gateway --> auth[Auth (next milestone)]
-  gateway --> storage[Local Storage Engine]
-  gateway --> metadata[SQLite Metadata]
-  gateway --> observability[Metrics/Health]
+  client(("Client")) -->|"HTTPS"| gateway["HTTP Server"]
+  gateway --> auth["Auth (OIDC/JWT + JWKS)"]
+  gateway --> storage["Local Storage Engine"]
+  gateway --> metadata["SQLite Metadata"]
+  gateway --> observability["Metrics/Health"]
 ```
 
 ## Quickstart
@@ -129,7 +129,7 @@ Troubleshooting:
 - Download supports HTTP range requests.
 
 ## Roadmap
-- **Milestone 3**: OIDC/JWT validation with JWKS caching (Keycloak dev compose).
+- **Milestone 3**: OIDC/JWT validation with JWKS caching (completed).
 - **Milestone 4**: Multipart uploads, background cleanup jobs.
 - **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts.
 - **Milestone 6**: Distributed mode with metadata service and storage nodes.
