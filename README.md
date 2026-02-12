@@ -113,6 +113,10 @@ Troubleshooting:
 - `audience mismatch`: set `auth.audience` to match token `aud`, or use empty string to skip.
 - `jwks fetch failed`: verify `auth.jwks_url` and IdP reachability from NebulaFS process.
 
+### Known limitations (Milestone 3 baseline)
+- OpenSSL 3 deprecation warnings appear in JWT/JWKS test helper code (`RSA_*` APIs). They are test-only warnings and do not block runtime behavior.
+- `/metrics` is currently treated as a protected endpoint when `auth.enabled=true` (only `/healthz` and `/readyz` are public).
+
 ## Security Model (Current)
 - TLS supported via config; disabled by default for local dev.
 - Auth is available via OIDC/JWT when enabled in config. Health is public; all other endpoints require a valid token.
