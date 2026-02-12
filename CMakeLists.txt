@@ -71,6 +71,7 @@ if(NEBULAFS_ENABLE_TESTS)
     find_package(GTest REQUIRED)
 
     add_executable(nebulafs_unit_tests
+        tests/unit/test_config.cpp
         tests/unit/test_path_safety.cpp
         tests/unit/test_metadata_store.cpp
         tests/unit/test_jwt_verifier.cpp
