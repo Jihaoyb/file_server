@@ -1,10 +1,26 @@
 #include "nebulafs/core/config.h"
 
+#include <cctype>
+#include <stdexcept>
+
 #include <Poco/Util/JSONConfiguration.h>
 #include <Poco/Util/PropertyFileConfiguration.h>
 #include <Poco/AutoPtr.h>
 
 namespace nebulafs::core {
+
+namespace {
+
+bool IsBlank(const std::string& value) {
+    for (char c : value) {
+        if (!std::isspace(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
 
 Config LoadConfig(const std::string& path) {
     Poco::AutoPtr<Poco::Util::JSONConfiguration> cfg(
@@ -32,6 +48,16 @@ Config LoadConfig(const std::string& path) {
     config.auth.cache_ttl_seconds = cfg->getInt("auth.cache_ttl_seconds", 300);
     config.auth.clock_skew_seconds = cfg->getInt("auth.clock_skew_seconds", 60);
     config.auth.allowed_alg = cfg->getString("auth.allowed_alg", "RS256");
+
+    if (config.auth.enabled) {
+        // Fail fast so auth mode cannot run with incomplete trust configuration.
+        if (IsBlank(config.auth.issuer)) {
+            throw std::invalid_argument("auth.enabled=true requires non-empty auth.issuer");
+        }
+        if (IsBlank(config.auth.jwks_url)) {
+            throw std::invalid_argument("auth.enabled=true requires non-empty auth.jwks_url");
+        }
+    }
     return config;
 }
 
