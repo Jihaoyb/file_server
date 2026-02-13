@@ -24,6 +24,7 @@ add_library(nebulafs_core
     src/storage/local_storage.cpp
     src/observability/metrics.cpp
     src/http/router.cpp
+    src/http/route_registration.cpp
     src/http/http_server.cpp
 )
 

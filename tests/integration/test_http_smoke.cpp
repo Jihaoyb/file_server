@@ -370,6 +370,58 @@ TEST(IntegrationHttp, BasicCrudSmoke) {
     CleanupTempDir(temp_dir);
 }
 
+TEST(IntegrationHttp, MultipartUploadEndpoints) {
+    const auto port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const auto config_path = WriteServerConfig(temp_dir, port);
+    const auto db_path = WriteDatabaseConfig(temp_dir);
+
+    std::vector<std::string> args = {"--config", config_path.string(), "--database",
+                                     db_path.string()};
+    auto handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, args);
+    {
+        ServerProcess server(std::move(handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto initiate = SendRequest(http::verb::post, "127.0.0.1", port,
+                                    "/v1/buckets/demo/multipart-uploads",
+                                    R"({"object":"movie.bin"})", "application/json");
+        ASSERT_EQ(initiate.result(), http::status::ok);
+        Poco::JSON::Parser parser;
+        auto initiate_json = parser.parse(initiate.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto upload_id = initiate_json->getValue<std::string>("upload_id");
+        ASSERT_FALSE(upload_id.empty());
+
+        auto part1 = SendRequest(
+            http::verb::put, "127.0.0.1", port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/1", "hello-", "");
+        ASSERT_EQ(part1.result(), http::status::ok);
+
+        auto part2 = SendRequest(
+            http::verb::put, "127.0.0.1", port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/2", "world", "");
+        ASSERT_EQ(part2.result(), http::status::ok);
+
+        auto parts = SendRequest(http::verb::get, "127.0.0.1", port,
+                                 "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts", "",
+                                 "");
+        ASSERT_EQ(parts.result(), http::status::ok);
+        auto parts_json = parser.parse(parts.body()).extract<Poco::JSON::Object::Ptr>();
+        EXPECT_EQ(parts_json->getValue<std::string>("upload_id"), upload_id);
+        EXPECT_EQ(parts_json->getValue<std::string>("object"), "movie.bin");
+        EXPECT_EQ(parts_json->getValue<std::string>("state"), "uploading");
+        auto parts_arr = parts_json->getArray("parts");
+        ASSERT_TRUE(parts_arr);
+        ASSERT_EQ(parts_arr->size(), 2);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
 TEST(IntegrationHttp, AuthValidation) {
     const auto port = FindFreePort();
     const auto temp_dir = MakeTempDir();
