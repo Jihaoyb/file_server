@@ -400,11 +400,15 @@ TEST(IntegrationHttp, MultipartUploadEndpoints) {
             http::verb::put, "127.0.0.1", port,
             "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/1", "hello-", "");
         ASSERT_EQ(part1.result(), http::status::ok);
+        auto part1_json = parser.parse(part1.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto part1_etag = part1_json->getValue<std::string>("etag");
 
         auto part2 = SendRequest(
             http::verb::put, "127.0.0.1", port,
             "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/2", "world", "");
         ASSERT_EQ(part2.result(), http::status::ok);
+        auto part2_json = parser.parse(part2.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto part2_etag = part2_json->getValue<std::string>("etag");
 
         auto parts = SendRequest(http::verb::get, "127.0.0.1", port,
                                  "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts", "",
@@ -417,6 +421,71 @@ TEST(IntegrationHttp, MultipartUploadEndpoints) {
         auto parts_arr = parts_json->getArray("parts");
         ASSERT_TRUE(parts_arr);
         ASSERT_EQ(parts_arr->size(), 2);
+
+        const std::string complete_body = std::string("{\"parts\":[") +
+                                          "{\"part_number\":1,\"etag\":\"" + part1_etag + "\"}," +
+                                          "{\"part_number\":2,\"etag\":\"" + part2_etag + "\"}" +
+                                          "]}";
+        auto complete = SendRequest(
+            http::verb::post, "127.0.0.1", port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/complete", complete_body,
+            "application/json");
+        ASSERT_EQ(complete.result(), http::status::ok);
+
+        auto download = SendRequest(http::verb::get, "127.0.0.1", port,
+                                    "/v1/buckets/demo/objects/movie.bin", "", "");
+        EXPECT_EQ(download.result(), http::status::ok);
+        EXPECT_EQ(download.body(), "hello-world");
+
+        auto parts_after_complete =
+            SendRequest(http::verb::get, "127.0.0.1", port,
+                        "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts", "", "");
+        EXPECT_EQ(parts_after_complete.result(), http::status::not_found);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, MultipartAbortEndpoint) {
+    const auto port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const auto config_path = WriteServerConfig(temp_dir, port);
+    const auto db_path = WriteDatabaseConfig(temp_dir);
+
+    std::vector<std::string> args = {"--config", config_path.string(), "--database",
+                                     db_path.string()};
+    auto handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, args);
+    {
+        ServerProcess server(std::move(handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto initiate = SendRequest(http::verb::post, "127.0.0.1", port,
+                                    "/v1/buckets/demo/multipart-uploads",
+                                    R"({"object":"cancel.bin"})", "application/json");
+        ASSERT_EQ(initiate.result(), http::status::ok);
+        Poco::JSON::Parser parser;
+        auto initiate_json = parser.parse(initiate.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto upload_id = initiate_json->getValue<std::string>("upload_id");
+        ASSERT_FALSE(upload_id.empty());
+
+        auto part1 = SendRequest(
+            http::verb::put, "127.0.0.1", port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/1", "temp-data", "");
+        ASSERT_EQ(part1.result(), http::status::ok);
+
+        auto abort =
+            SendRequest(http::verb::delete_, "127.0.0.1", port,
+                        "/v1/buckets/demo/multipart-uploads/" + upload_id, "", "");
+        EXPECT_EQ(abort.result(), http::status::no_content);
+
+        auto parts_after_abort =
+            SendRequest(http::verb::get, "127.0.0.1", port,
+                        "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts", "", "");
+        EXPECT_EQ(parts_after_abort.result(), http::status::not_found);
     }
 
     CleanupTempDir(temp_dir);
