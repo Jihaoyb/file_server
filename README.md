@@ -57,6 +57,30 @@ curl -X POST \
   --data-binary @README.md \
   "http://localhost:8080/v1/buckets/demo/objects?name=readme.txt"
 
+# Multipart upload: initiate
+UPLOAD_ID=$(curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"object":"large.bin"}' \
+  http://localhost:8080/v1/buckets/demo/multipart-uploads | jq -r .upload_id)
+
+# Multipart upload: parts
+curl -X PUT --data-binary @part1.bin \
+  "http://localhost:8080/v1/buckets/demo/multipart-uploads/$UPLOAD_ID/parts/1"
+curl -X PUT --data-binary @part2.bin \
+  "http://localhost:8080/v1/buckets/demo/multipart-uploads/$UPLOAD_ID/parts/2"
+
+# Multipart upload: complete
+PART1_ETAG=$(curl -s "http://localhost:8080/v1/buckets/demo/multipart-uploads/$UPLOAD_ID/parts" \
+  | jq -r '.parts[] | select(.part_number==1) | .etag')
+PART2_ETAG=$(curl -s "http://localhost:8080/v1/buckets/demo/multipart-uploads/$UPLOAD_ID/parts" \
+  | jq -r '.parts[] | select(.part_number==2) | .etag')
+curl -X POST -H "Content-Type: application/json" \
+  -d "{\"parts\":[{\"part_number\":1,\"etag\":\"$PART1_ETAG\"},{\"part_number\":2,\"etag\":\"$PART2_ETAG\"}]}" \
+  "http://localhost:8080/v1/buckets/demo/multipart-uploads/$UPLOAD_ID/complete"
+
+# Multipart upload: abort
+curl -X DELETE "http://localhost:8080/v1/buckets/demo/multipart-uploads/$UPLOAD_ID"
+
 # Download object
 curl http://localhost:8080/v1/buckets/demo/objects/readme.txt -o readme.txt
 
@@ -130,12 +154,14 @@ Troubleshooting:
 
 ## Roadmap
 - **Milestone 3**: OIDC/JWT validation with JWKS caching (completed).
-- **Milestone 4**: Multipart uploads, background cleanup jobs.
+- **Milestone 3.1**: Startup auth config hardening (completed).
+- **Milestone 4**: Multipart uploads and cleanup baseline (in progress).
 - **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts.
 - **Milestone 6**: Distributed mode with metadata service and storage nodes.
 
 ## Docs
 - Architecture: `docs/architecture.md`
+- Milestone 4 design: `docs/design/milestone-4-multipart-cleanup.md`
 - Threat model: `docs/threat-model.md`
 - ADRs: `docs/adr/`
 - Code style: `docs/code-style.md`

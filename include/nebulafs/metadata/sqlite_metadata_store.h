@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include <Poco/Data/Session.h>
@@ -25,6 +26,26 @@ public:
                                                            const std::string& prefix) override;
     core::Result<void> DeleteObject(const std::string& bucket,
                                     const std::string& object) override;
+
+    core::Result<MultipartUpload> CreateMultipartUpload(const std::string& bucket,
+                                                        const std::string& upload_id,
+                                                        const std::string& object_name,
+                                                        const std::string& expires_at) override;
+    core::Result<MultipartUpload> GetMultipartUpload(const std::string& upload_id) override;
+    core::Result<std::vector<MultipartUpload>> ListExpiredMultipartUploads(
+        const std::string& expires_before, int limit) override;
+    core::Result<void> UpdateMultipartUploadState(const std::string& upload_id,
+                                                  const std::string& state) override;
+    core::Result<void> DeleteMultipartUpload(const std::string& upload_id) override;
+
+    core::Result<MultipartPart> UpsertMultipartPart(const std::string& upload_id,
+                                                    int part_number,
+                                                    std::uint64_t size_bytes,
+                                                    const std::string& etag,
+                                                    const std::string& temp_path) override;
+    core::Result<std::vector<MultipartPart>> ListMultipartParts(
+        const std::string& upload_id) override;
+    core::Result<void> DeleteMultipartParts(const std::string& upload_id) override;
 
 private:
     // Schema creation is done once per store instance; in production this will be migrated.

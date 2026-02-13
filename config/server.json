@@ -14,7 +14,16 @@
   },
   "storage": {
     "base_path": "data",
-    "temp_path": "data/tmp"
+    "temp_path": "data/tmp",
+    "multipart": {
+      "max_upload_ttl_seconds": 86400
+    }
+  },
+  "cleanup": {
+    "enabled": true,
+    "sweep_interval_seconds": 300,
+    "grace_period_seconds": 60,
+    "max_uploads_per_sweep": 200
   },
   "observability": {
     "log_level": "information"

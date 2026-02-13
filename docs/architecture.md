@@ -6,7 +6,15 @@
 - `http/`: Beast-based HTTP server, routing, request context.
 - `storage/`: filesystem storage engine with atomic writes.
 - `metadata/`: SQLite-backed metadata store.
+- `auth/`: JWT parsing/verification with JWKS cache.
 - `observability/`: health, readiness, metrics.
+
+## Planned Milestone 4 extensions
+
+- Multipart upload coordinator (initiate, part upload, complete, abort).
+- Multipart metadata tables for in-progress uploads and parts.
+- Background cleanup sweep for expired/incomplete uploads.
+- Additional multipart metrics (throughput, failures, cleanup activity).
 
 ## Concurrency Model
 
