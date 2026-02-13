@@ -27,9 +27,23 @@ struct ServerConfig {
 };
 
 /// @brief Storage configuration for local filesystem backend.
+struct MultipartConfig {
+    int max_upload_ttl_seconds{86400};
+};
+
+/// @brief Storage configuration for local filesystem backend.
 struct StorageConfig {
     std::string base_path{"data"};
     std::string temp_path{"data/tmp"};
+    MultipartConfig multipart;
+};
+
+/// @brief Background cleanup settings for multipart temp data.
+struct CleanupJobConfig {
+    bool enabled{true};
+    int sweep_interval_seconds{300};
+    int grace_period_seconds{60};
+    int max_uploads_per_sweep{200};
 };
 
 /// @brief Observability settings (logging).
@@ -52,6 +66,7 @@ struct AuthConfig {
 struct Config {
     ServerConfig server;
     StorageConfig storage;
+    CleanupJobConfig cleanup;
     ObservabilityConfig observability;
     AuthConfig auth;
 };

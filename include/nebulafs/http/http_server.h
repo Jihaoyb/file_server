@@ -5,6 +5,7 @@
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ssl/context.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include "nebulafs/core/config.h"
 #include "nebulafs/auth/jwt_verifier.h"
@@ -23,6 +24,10 @@ public:
     void Run();
 
 private:
+    void StartCleanupJob();
+    void ScheduleCleanupSweep();
+    void RunCleanupSweep();
+
     boost::asio::io_context& ioc_;
     core::Config config_;
     Router router_;
@@ -30,6 +35,7 @@ private:
     std::shared_ptr<metadata::MetadataStore> metadata_;
     std::shared_ptr<auth::JwtVerifier> auth_verifier_;
     std::unique_ptr<boost::asio::ssl::context> ssl_context_;
+    std::unique_ptr<boost::asio::steady_timer> cleanup_timer_;
 };
 
 }  // namespace nebulafs::http

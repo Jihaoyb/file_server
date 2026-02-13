@@ -38,6 +38,13 @@ Config LoadConfig(const std::string& path) {
 
     config.storage.base_path = cfg->getString("storage.base_path", "data");
     config.storage.temp_path = cfg->getString("storage.temp_path", "data/tmp");
+    config.storage.multipart.max_upload_ttl_seconds =
+        cfg->getInt("storage.multipart.max_upload_ttl_seconds", 86400);
+
+    config.cleanup.enabled = cfg->getBool("cleanup.enabled", true);
+    config.cleanup.sweep_interval_seconds = cfg->getInt("cleanup.sweep_interval_seconds", 300);
+    config.cleanup.grace_period_seconds = cfg->getInt("cleanup.grace_period_seconds", 60);
+    config.cleanup.max_uploads_per_sweep = cfg->getInt("cleanup.max_uploads_per_sweep", 200);
 
     config.observability.log_level = cfg->getString("observability.log_level", "information");
 
@@ -57,6 +64,15 @@ Config LoadConfig(const std::string& path) {
         if (IsBlank(config.auth.jwks_url)) {
             throw std::invalid_argument("auth.enabled=true requires non-empty auth.jwks_url");
         }
+    }
+    if (config.storage.multipart.max_upload_ttl_seconds <= 0) {
+        throw std::invalid_argument("storage.multipart.max_upload_ttl_seconds must be positive");
+    }
+    if (config.cleanup.sweep_interval_seconds <= 0) {
+        throw std::invalid_argument("cleanup.sweep_interval_seconds must be positive");
+    }
+    if (config.cleanup.max_uploads_per_sweep <= 0) {
+        throw std::invalid_argument("cleanup.max_uploads_per_sweep must be positive");
     }
     return config;
 }

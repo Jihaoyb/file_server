@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
                                                                      config.storage.temp_path);
 
     nebulafs::http::Router router;
-    nebulafs::http::RegisterDefaultRoutes(router, metadata, storage);
+    nebulafs::http::RegisterDefaultRoutes(router, metadata, storage, config);
 
     boost::asio::io_context ioc(config.server.threads);
     nebulafs::http::HttpServer server(ioc, config, std::move(router), storage, metadata);

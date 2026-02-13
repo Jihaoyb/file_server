@@ -156,7 +156,8 @@ core::Result<std::vector<CompletePart>> ParseCompleteParts(const std::string& bo
 }  // namespace
 
 void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataStore> metadata,
-                           std::shared_ptr<storage::LocalStorage> storage) {
+                           std::shared_ptr<storage::LocalStorage> storage,
+                           const core::Config& config) {
     router.Add("GET", "/healthz",
                [](const RequestContext& ctx, const HttpRequest& req, const RouteParams&) {
                    return JsonOk(req.version(),
@@ -252,7 +253,9 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataSto
                });
 
     router.Add("POST", "/v1/buckets/{bucket}/multipart-uploads",
-               [metadata](const RequestContext& ctx, const HttpRequest& req,
+               [metadata,
+                ttl_seconds = config.storage.multipart.max_upload_ttl_seconds](
+                   const RequestContext& ctx, const HttpRequest& req,
                           const RouteParams& params) {
                    const auto bucket = params.at("bucket");
                    if (!storage::LocalStorage::IsSafeName(bucket)) {
@@ -278,7 +281,8 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataSto
                        }
 
                        const auto upload_id = Poco::UUIDGenerator().createOne().toString();
-                       const auto expires_at = core::NowIso8601();
+                       const auto expires_at =
+                           core::NowIso8601WithOffsetSeconds(ttl_seconds);
                        auto created =
                            metadata->CreateMultipartUpload(bucket, upload_id, object_name, expires_at);
                        if (!created.ok()) {

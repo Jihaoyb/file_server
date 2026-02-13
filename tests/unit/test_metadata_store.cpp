@@ -99,3 +99,33 @@ TEST(MetadataStore, MultipartUploadLifecycle) {
 
     std::filesystem::remove(db_path);
 }
+
+TEST(MetadataStore, ListExpiredMultipartUploads) {
+    const auto db_path = MakeTempDbPath();
+
+    {
+        nebulafs::metadata::SqliteMetadataStore store(db_path.string());
+        auto bucket = store.CreateBucket("expiry");
+        ASSERT_TRUE(bucket.ok());
+
+        ASSERT_TRUE(store.CreateMultipartUpload("expiry", "expired-1", "a.bin",
+                                                "2000-01-01T00:00:00Z")
+                        .ok());
+        ASSERT_TRUE(store.CreateMultipartUpload("expiry", "expired-2", "b.bin",
+                                                "2000-01-01T00:00:01Z")
+                        .ok());
+        ASSERT_TRUE(store.CreateMultipartUpload("expiry", "future-1", "c.bin",
+                                                "2999-01-01T00:00:00Z")
+                        .ok());
+
+        auto mark_completed = store.UpdateMultipartUploadState("expired-2", "completed");
+        ASSERT_TRUE(mark_completed.ok());
+
+        auto expired = store.ListExpiredMultipartUploads("2020-01-01T00:00:00Z", 10);
+        ASSERT_TRUE(expired.ok());
+        ASSERT_EQ(expired.value().size(), 1);
+        EXPECT_EQ(expired.value()[0].upload_id, "expired-1");
+    }
+
+    std::filesystem::remove(db_path);
+}

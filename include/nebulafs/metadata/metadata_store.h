@@ -73,6 +73,8 @@ public:
                                                                 const std::string& object_name,
                                                                 const std::string& expires_at) = 0;
     virtual core::Result<MultipartUpload> GetMultipartUpload(const std::string& upload_id) = 0;
+    virtual core::Result<std::vector<MultipartUpload>> ListExpiredMultipartUploads(
+        const std::string& expires_before, int limit) = 0;
     virtual core::Result<void> UpdateMultipartUploadState(const std::string& upload_id,
                                                           const std::string& state) = 0;
     virtual core::Result<void> DeleteMultipartUpload(const std::string& upload_id) = 0;

@@ -32,6 +32,8 @@ public:
                                                         const std::string& object_name,
                                                         const std::string& expires_at) override;
     core::Result<MultipartUpload> GetMultipartUpload(const std::string& upload_id) override;
+    core::Result<std::vector<MultipartUpload>> ListExpiredMultipartUploads(
+        const std::string& expires_before, int limit) override;
     core::Result<void> UpdateMultipartUploadState(const std::string& upload_id,
                                                   const std::string& state) override;
     core::Result<void> DeleteMultipartUpload(const std::string& upload_id) override;

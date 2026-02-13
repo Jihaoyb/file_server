@@ -26,6 +26,7 @@
 
 #include "nebulafs/core/ids.h"
 #include "nebulafs/core/logger.h"
+#include "nebulafs/core/time.h"
 #include "nebulafs/observability/metrics.h"
 #include "nebulafs/auth/jwt_utils.h"
 #include "nebulafs/auth/jwt_verifier.h"
@@ -695,6 +696,8 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, const core::Config& config,
 }
 
 void HttpServer::Run() {
+    StartCleanupJob();
+
     const auto address = net::ip::make_address(config_.server.host);
     const tcp::endpoint endpoint{address, static_cast<unsigned short>(config_.server.port)};
 
@@ -702,6 +705,52 @@ void HttpServer::Run() {
                                auth_verifier_,
                                ssl_context_ ? ssl_context_.get() : nullptr)
         ->Run();
+}
+
+void HttpServer::StartCleanupJob() {
+    if (!config_.cleanup.enabled) {
+        return;
+    }
+    cleanup_timer_ = std::make_unique<net::steady_timer>(ioc_);
+    ScheduleCleanupSweep();
+}
+
+void HttpServer::ScheduleCleanupSweep() {
+    if (!cleanup_timer_) {
+        return;
+    }
+    cleanup_timer_->expires_after(
+        std::chrono::seconds(config_.cleanup.sweep_interval_seconds));
+    cleanup_timer_->async_wait([this](const beast::error_code& ec) {
+        if (ec) {
+            return;
+        }
+        RunCleanupSweep();
+        ScheduleCleanupSweep();
+    });
+}
+
+void HttpServer::RunCleanupSweep() {
+    const auto cutoff = nebulafs::core::NowIso8601WithOffsetSeconds(
+        -config_.cleanup.grace_period_seconds);
+    auto expired = metadata_->ListExpiredMultipartUploads(
+        cutoff, config_.cleanup.max_uploads_per_sweep);
+    if (!expired.ok()) {
+        nebulafs::core::LogError("Cleanup sweep failed to list uploads: " +
+                                 expired.error().message);
+        return;
+    }
+
+    for (const auto& upload : expired.value()) {
+        (void)metadata_->UpdateMultipartUploadState(upload.upload_id, "expired");
+        (void)metadata_->DeleteMultipartParts(upload.upload_id);
+        (void)metadata_->DeleteMultipartUpload(upload.upload_id);
+
+        std::error_code ec;
+        const auto path = std::filesystem::path(storage_->temp_path()) / "multipart" /
+                          upload.upload_id;
+        std::filesystem::remove_all(path, ec);
+    }
 }
 
 }  // namespace nebulafs::http

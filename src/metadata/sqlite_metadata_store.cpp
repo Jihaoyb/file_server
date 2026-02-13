@@ -269,6 +269,37 @@ core::Result<MultipartUpload> SqliteMetadataStore::GetMultipartUpload(const std:
     return upload;
 }
 
+core::Result<std::vector<MultipartUpload>> SqliteMetadataStore::ListExpiredMultipartUploads(
+    const std::string& expires_before, int limit) {
+    std::vector<MultipartUpload> uploads;
+    MultipartUpload upload;
+
+    std::string cutoff_value = expires_before;
+    int limit_value = limit;
+    Poco::Data::Statement select(session_);
+    select <<
+            "SELECT id, upload_id, bucket_id, object_name, state, expires_at, created_at, "
+            "updated_at FROM multipart_uploads "
+            "WHERE state IN ('initiated', 'uploading') AND expires_at < ? "
+            "ORDER BY expires_at ASC LIMIT ?",
+        use(cutoff_value), use(limit_value), into(upload.id), into(upload.upload_id),
+        into(upload.bucket_id), into(upload.object_name), into(upload.state),
+        into(upload.expires_at), into(upload.created_at), into(upload.updated_at), range(0, 1);
+
+    while (!select.done()) {
+        upload = {};
+        select.execute();
+        if (select.done() && upload.upload_id.empty()) {
+            break;
+        }
+        if (!upload.upload_id.empty()) {
+            uploads.push_back(upload);
+        }
+    }
+
+    return uploads;
+}
+
 core::Result<void> SqliteMetadataStore::UpdateMultipartUploadState(const std::string& upload_id,
                                                                    const std::string& state) {
     auto upload = GetMultipartUpload(upload_id);
