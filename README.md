@@ -10,7 +10,7 @@ NebulaFS is a production-grade, cloud-storage style file server written in C++20
 - **Structured logging** via Poco with request correlation.
 - **Security-first** design with OIDC/JWT auth and JWKS validation support.
 
-## Architecture (Milestone 0–3)
+## Architecture (Milestone 0–4)
 
 ```mermaid
 flowchart LR
@@ -38,6 +38,12 @@ cmake --build --preset debug
 ```bash
 ./build/debug/nebulafs --config config/server.json
 ```
+
+### Traffic controls
+`config/server.json` supports:
+- `server.limits.request_timeout_ms` (default `30000`)
+- `server.limits.rate_limit_rps` (default `0`, disabled)
+- `server.limits.rate_limit_burst` (default `0`, disabled)
 
 ### Example API calls
 ```bash
@@ -155,8 +161,8 @@ Troubleshooting:
 ## Roadmap
 - **Milestone 3**: OIDC/JWT validation with JWKS caching (completed).
 - **Milestone 3.1**: Startup auth config hardening (completed).
-- **Milestone 4**: Multipart uploads and cleanup baseline (in progress).
-- **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts.
+- **Milestone 4**: Multipart uploads and cleanup baseline (completed).
+- **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts (in progress).
 - **Milestone 6**: Distributed mode with metadata service and storage nodes.
 
 ## Docs

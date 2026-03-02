@@ -8,10 +8,13 @@
 #include <Poco/UUIDGenerator.h>
 
 #include <chrono>
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,6 +44,13 @@ struct AuthConfig {
     int cache_ttl_seconds{300};
     int clock_skew_seconds{60};
     std::string allowed_alg{"RS256"};
+};
+
+struct LimitConfig {
+    std::uint64_t max_body_bytes{1048576};
+    int request_timeout_ms{30000};
+    int rate_limit_rps{0};
+    int rate_limit_burst{0};
 };
 
 class ServerProcess {
@@ -98,7 +108,8 @@ void CleanupTempDir(const std::filesystem::path& dir) {
 
 std::filesystem::path WriteServerConfig(const std::filesystem::path& dir,
                                         unsigned short port,
-                                        const AuthConfig& auth = {}) {
+                                        const AuthConfig& auth = {},
+                                        const LimitConfig& limits = {}) {
     const auto storage_dir = dir / "storage";
     const auto temp_dir = storage_dir / "tmp";
     std::filesystem::create_directories(temp_dir);
@@ -116,7 +127,10 @@ std::filesystem::path WriteServerConfig(const std::filesystem::path& dir,
         << "      \"private_key\": \"\"\n"
         << "    },\n"
         << "    \"limits\": {\n"
-        << "      \"max_body_bytes\": 1048576\n"
+        << "      \"max_body_bytes\": " << limits.max_body_bytes << ",\n"
+        << "      \"request_timeout_ms\": " << limits.request_timeout_ms << ",\n"
+        << "      \"rate_limit_rps\": " << limits.rate_limit_rps << ",\n"
+        << "      \"rate_limit_burst\": " << limits.rate_limit_burst << "\n"
         << "    }\n"
         << "  },\n"
         << "  \"storage\": {\n"
@@ -322,6 +336,22 @@ bool WaitForHealth(const std::string& host, unsigned short port) {
     return false;
 }
 
+std::optional<long long> ParseMetricCounter(const std::string& metrics, const std::string& name) {
+    const std::string prefix = name + " ";
+    std::stringstream ss(metrics);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (line.rfind(prefix, 0) == 0) {
+            try {
+                return std::stoll(line.substr(prefix.size()));
+            } catch (const std::exception&) {
+                return std::nullopt;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 TEST(IntegrationHttp, BasicCrudSmoke) {
@@ -495,6 +525,85 @@ TEST(IntegrationHttp, MultipartAbortEndpoint) {
             SendRequest(http::verb::get, "127.0.0.1", port,
                         "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts", "", "");
         EXPECT_EQ(parts_after_abort.result(), http::status::not_found);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, RateLimiting) {
+    const auto port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    LimitConfig limits;
+    limits.rate_limit_rps = 1;
+    limits.rate_limit_burst = 1;
+    const auto config_path = WriteServerConfig(temp_dir, port, {}, limits);
+    const auto db_path = WriteDatabaseConfig(temp_dir);
+
+    std::vector<std::string> args = {"--config", config_path.string(), "--database",
+                                     db_path.string()};
+    auto handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, args);
+    {
+        ServerProcess server(std::move(handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", port));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+        auto first = SendRequest(http::verb::get, "127.0.0.1", port, "/healthz", "", "");
+        auto second = SendRequest(http::verb::get, "127.0.0.1", port, "/healthz", "", "");
+        auto third = SendRequest(http::verb::get, "127.0.0.1", port, "/healthz", "", "");
+
+        EXPECT_EQ(first.result(), http::status::ok);
+        EXPECT_TRUE(second.result() == http::status::too_many_requests ||
+                    third.result() == http::status::too_many_requests);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, RequestTimeout) {
+    const auto port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    LimitConfig limits;
+    limits.max_body_bytes = 64 * 1024 * 1024;
+    limits.request_timeout_ms = 20;
+    const auto config_path = WriteServerConfig(temp_dir, port, {}, limits);
+    const auto db_path = WriteDatabaseConfig(temp_dir);
+
+    std::vector<std::string> args = {"--config", config_path.string(), "--database",
+                                     db_path.string()};
+    auto handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, args);
+    {
+        ServerProcess server(std::move(handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto metrics_before = SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "");
+        ASSERT_EQ(metrics_before.result(), http::status::ok);
+        const auto before_timeout = ParseMetricCounter(metrics_before.body(),
+                                                       "nebulafs_http_requests_timed_out_total")
+                                        .value_or(0);
+
+        const std::string payload(8 * 1024 * 1024, 'x');
+        bool timeout_observed = false;
+        try {
+            auto upload = SendRequest(http::verb::put, "127.0.0.1", port,
+                                      "/v1/buckets/demo/objects/slow.bin", payload, "");
+            timeout_observed = upload.result() == http::status::request_timeout;
+        } catch (const std::exception&) {
+            // Connection reset during oversized timed-out upload is acceptable;
+            // timeout is validated via metrics increment below.
+            timeout_observed = true;
+        }
+        EXPECT_TRUE(timeout_observed);
+
+        auto metrics_after = SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "");
+        ASSERT_EQ(metrics_after.result(), http::status::ok);
+        const auto after_timeout =
+            ParseMetricCounter(metrics_after.body(), "nebulafs_http_requests_timed_out_total")
+                .value_or(0);
+        EXPECT_GT(after_timeout, before_timeout);
     }
 
     CleanupTempDir(temp_dir);

@@ -35,6 +35,9 @@ Config LoadConfig(const std::string& path) {
     config.server.tls.private_key = cfg->getString("server.tls.private_key", "");
     config.server.limits.max_body_bytes =
         static_cast<std::uint64_t>(cfg->getInt64("server.limits.max_body_bytes", 268435456));
+    config.server.limits.request_timeout_ms = cfg->getInt("server.limits.request_timeout_ms", 30000);
+    config.server.limits.rate_limit_rps = cfg->getInt("server.limits.rate_limit_rps", 0);
+    config.server.limits.rate_limit_burst = cfg->getInt("server.limits.rate_limit_burst", 0);
 
     config.storage.base_path = cfg->getString("storage.base_path", "data");
     config.storage.temp_path = cfg->getString("storage.temp_path", "data/tmp");
@@ -73,6 +76,15 @@ Config LoadConfig(const std::string& path) {
     }
     if (config.cleanup.max_uploads_per_sweep <= 0) {
         throw std::invalid_argument("cleanup.max_uploads_per_sweep must be positive");
+    }
+    if (config.server.limits.request_timeout_ms <= 0) {
+        throw std::invalid_argument("server.limits.request_timeout_ms must be positive");
+    }
+    if (config.server.limits.rate_limit_rps < 0) {
+        throw std::invalid_argument("server.limits.rate_limit_rps must be >= 0");
+    }
+    if (config.server.limits.rate_limit_burst < 0) {
+        throw std::invalid_argument("server.limits.rate_limit_burst must be >= 0");
     }
     return config;
 }

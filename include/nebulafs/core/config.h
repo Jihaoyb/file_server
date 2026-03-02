@@ -15,6 +15,9 @@ struct TlsConfig {
 /// @brief Request/connection limits for the HTTP server.
 struct LimitsConfig {
     std::uint64_t max_body_bytes{268435456};
+    int request_timeout_ms{30000};
+    int rate_limit_rps{0};
+    int rate_limit_burst{0};
 };
 
 /// @brief HTTP server configuration (bind address, TLS, limits).

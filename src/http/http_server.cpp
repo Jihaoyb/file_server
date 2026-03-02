@@ -1,11 +1,13 @@
 #include "nebulafs/http/http_server.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -45,6 +47,47 @@ namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
 constexpr std::size_t kBufferSize = 8192;
+
+class RateLimiter {
+public:
+    RateLimiter(int rps, int burst)
+        : enabled_(rps > 0),
+          rate_per_second_(static_cast<double>(std::max(0, rps))),
+          capacity_(static_cast<double>(std::max(0, burst > 0 ? burst : rps))),
+          tokens_(capacity_),
+          last_refill_(std::chrono::steady_clock::now()) {
+    }
+
+    bool Allow() {
+        if (!enabled_) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mu_);
+        RefillLocked();
+        if (tokens_ < 1.0) {
+            return false;
+        }
+        tokens_ -= 1.0;
+        return true;
+    }
+
+private:
+    void RefillLocked() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_refill_).count();
+        last_refill_ = now;
+        tokens_ = std::min(capacity_, tokens_ + elapsed * rate_per_second_);
+    }
+
+    bool enabled_{false};
+    double rate_per_second_{0.0};
+    double capacity_{0.0};
+    double tokens_{0.0};
+    std::chrono::steady_clock::time_point last_refill_{};
+    std::mutex mu_;
+};
 
 struct RangeRequest {
     std::uint64_t start{0};
@@ -128,19 +171,25 @@ http::response<http::string_body> ErrorResponse(http::status status, int version
     return JsonResponse(status, version, body);
 }
 
+bool IsTimeoutError(const beast::error_code& ec) {
+    return ec == beast::error::timeout || ec == net::error::timed_out;
+}
+
 template <typename Stream>
 class Session : public std::enable_shared_from_this<Session<Stream>> {
 public:
     Session(Stream&& stream, nebulafs::http::Router router, nebulafs::core::Config config,
             std::shared_ptr<nebulafs::storage::LocalStorage> storage,
             std::shared_ptr<nebulafs::metadata::MetadataStore> metadata,
-            std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier)
+            std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier,
+            std::shared_ptr<RateLimiter> rate_limiter)
         : stream_(std::move(stream)),
           router_(std::move(router)),
           config_(std::move(config)),
           storage_(std::move(storage)),
           metadata_(std::move(metadata)),
-          auth_verifier_(std::move(auth_verifier)) {
+          auth_verifier_(std::move(auth_verifier)),
+          rate_limiter_(std::move(rate_limiter)) {
     }
 
     void Start() {
@@ -164,6 +213,8 @@ private:
     }
 
     void DoReadHeader() {
+        beast::get_lowest_layer(stream_).expires_after(
+            std::chrono::milliseconds(config_.server.limits.request_timeout_ms));
         parser_.emplace();
         parser_->body_limit(config_.server.limits.max_body_bytes);
         http::async_read_header(stream_, buffer_, *parser_,
@@ -176,6 +227,9 @@ private:
             return DoClose();
         }
         if (ec) {
+            if (IsTimeoutError(ec)) {
+                nebulafs::observability::RecordTimedOut();
+            }
             nebulafs::core::LogError("Read header failed: " + ec.message());
             return;
         }
@@ -184,12 +238,21 @@ private:
         // Clear any previous request state for reused sessions.
         auth_claims_.reset();
         request_start_ = std::chrono::steady_clock::now();
+        timeout_response_sent_ = false;
         request_method_ = std::string(parser_->get().method_string());
         request_target_ = std::string(parser_->get().target());
         request_remote_ = GetRemoteAddress();
         const auto target = request_target_;
         const auto path = StripQuery(target);
         const auto method = parser_->get().method();
+
+        if (rate_limiter_ && !rate_limiter_->Allow()) {
+            nebulafs::observability::RecordRateLimited();
+            auto response = ErrorResponse(http::status::too_many_requests, parser_->get().version(),
+                                          "RATE_LIMITED", "rate limit exceeded", request_id_);
+            response.keep_alive(false);
+            return Send(std::move(response));
+        }
 
         // Enforce auth early to avoid streaming uploads for unauthorized requests.
         auto auth_response = EnsureAuthorized(parser_->get(), path);
@@ -234,6 +297,8 @@ private:
     }
 
     void DoReadBodyChunk() {
+        beast::get_lowest_layer(stream_).expires_after(
+            std::chrono::milliseconds(config_.server.limits.request_timeout_ms));
         parser_->get().body().data = body_buffer_.data();
         parser_->get().body().size = body_buffer_.size();
         http::async_read(stream_, buffer_, *parser_,
@@ -243,8 +308,14 @@ private:
 
     void OnBodyChunk(beast::error_code ec, std::size_t) {
         if (ec && ec != http::error::need_buffer) {
+            if (IsTimeoutError(ec)) {
+                return SendRequestTimeout(parser_ ? parser_->get().version() : 11);
+            }
             nebulafs::core::LogError("Read body failed: " + ec.message());
             return;
+        }
+        if (RequestTimedOut()) {
+            return SendRequestTimeout(parser_->get().version());
         }
         const auto bytes = body_buffer_.size() - parser_->get().body().size;
         body_.append(body_buffer_.data(), bytes);
@@ -255,6 +326,9 @@ private:
     }
 
     void HandleRequest() {
+        if (RequestTimedOut()) {
+            return SendRequestTimeout(parser_->get().version());
+        }
         // Convert buffer_body parser into a string_body request for routing handlers.
         nebulafs::http::HttpRequest request;
         request.method(parser_->get().method());
@@ -403,6 +477,8 @@ private:
     }
 
     void DoReadUploadChunk() {
+        beast::get_lowest_layer(stream_).expires_after(
+            std::chrono::milliseconds(config_.server.limits.request_timeout_ms));
         parser_->get().body().data = body_buffer_.data();
         parser_->get().body().size = body_buffer_.size();
         http::async_read(stream_, buffer_, *parser_,
@@ -412,8 +488,14 @@ private:
 
     void OnUploadChunk(beast::error_code ec, std::size_t) {
         if (ec && ec != http::error::need_buffer) {
+            if (IsTimeoutError(ec)) {
+                return SendRequestTimeout(parser_ ? parser_->get().version() : 11);
+            }
             nebulafs::core::LogError("Read upload failed: " + ec.message());
             return;
+        }
+        if (RequestTimedOut()) {
+            return SendRequestTimeout(parser_->get().version());
         }
         const auto bytes = body_buffer_.size() - parser_->get().body().size;
         if (bytes > 0) {
@@ -541,6 +623,8 @@ private:
 
     template <typename Body>
     void Send(http::response<Body>&& response) {
+        // Disable read deadline while writing a response to avoid write-side timeout races.
+        beast::get_lowest_layer(stream_).expires_never();
         response.set(http::field::server, "NebulaFS");
         response.set("X-Request-Id", request_id_);
         const auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -586,6 +670,25 @@ private:
         return endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
     }
 
+    bool RequestTimedOut() const {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - request_start_)
+                                 .count();
+        return elapsed > config_.server.limits.request_timeout_ms;
+    }
+
+    void SendRequestTimeout(int version) {
+        if (timeout_response_sent_) {
+            return;
+        }
+        timeout_response_sent_ = true;
+        nebulafs::observability::RecordTimedOut();
+        auto response = ErrorResponse(http::status::request_timeout, version, "REQUEST_TIMEOUT",
+                                      "request exceeded timeout budget", request_id_);
+        response.keep_alive(false);
+        Send(std::move(response));
+    }
+
     Stream stream_;
     beast::flat_buffer buffer_;
     std::optional<http::request_parser<http::buffer_body>> parser_;
@@ -596,12 +699,14 @@ private:
     std::shared_ptr<nebulafs::storage::LocalStorage> storage_;
     std::shared_ptr<nebulafs::metadata::MetadataStore> metadata_;
     std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier_;
+    std::shared_ptr<RateLimiter> rate_limiter_;
 
     std::string request_id_;
     std::string request_method_;
     std::string request_target_;
     std::string request_remote_;
     std::chrono::steady_clock::time_point request_start_{};
+    bool timeout_response_sent_{false};
     std::string body_;
     std::optional<nebulafs::auth::JwtClaims> auth_claims_;
 
@@ -624,6 +729,7 @@ public:
              std::shared_ptr<nebulafs::storage::LocalStorage> storage,
              std::shared_ptr<nebulafs::metadata::MetadataStore> metadata,
              std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier,
+             std::shared_ptr<RateLimiter> rate_limiter,
              net::ssl::context* ssl_ctx)
         : acceptor_(ioc),
           router_(std::move(router)),
@@ -631,6 +737,7 @@ public:
           storage_(std::move(storage)),
           metadata_(std::move(metadata)),
           auth_verifier_(std::move(auth_verifier)),
+          rate_limiter_(std::move(rate_limiter)),
           ssl_ctx_(ssl_ctx) {
         beast::error_code ec;
         acceptor_.open(endpoint.protocol(), ec);
@@ -654,12 +761,14 @@ private:
             if (ssl_ctx_) {
                 auto stream = beast::ssl_stream<beast::tcp_stream>(std::move(socket), *ssl_ctx_);
                 std::make_shared<Session<beast::ssl_stream<beast::tcp_stream>>>(
-                    std::move(stream), router_, config_, storage_, metadata_, auth_verifier_)
+                    std::move(stream), router_, config_, storage_, metadata_, auth_verifier_,
+                    rate_limiter_)
                     ->Start();
             } else {
                 auto stream = beast::tcp_stream(std::move(socket));
                 std::make_shared<Session<beast::tcp_stream>>(std::move(stream), router_, config_,
-                                                             storage_, metadata_, auth_verifier_)
+                                                             storage_, metadata_, auth_verifier_,
+                                                             rate_limiter_)
                     ->Start();
             }
         }
@@ -672,6 +781,7 @@ private:
     std::shared_ptr<nebulafs::storage::LocalStorage> storage_;
     std::shared_ptr<nebulafs::metadata::MetadataStore> metadata_;
     std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier_;
+    std::shared_ptr<RateLimiter> rate_limiter_;
     net::ssl::context* ssl_ctx_{nullptr};
 };
 
@@ -697,12 +807,14 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, const core::Config& config,
 
 void HttpServer::Run() {
     StartCleanupJob();
+    auto rate_limiter = std::make_shared<RateLimiter>(config_.server.limits.rate_limit_rps,
+                                                      config_.server.limits.rate_limit_burst);
 
     const auto address = net::ip::make_address(config_.server.host);
     const tcp::endpoint endpoint{address, static_cast<unsigned short>(config_.server.port)};
 
     std::make_shared<Listener>(ioc_, endpoint, router_, config_, storage_, metadata_,
-                               auth_verifier_,
+                               auth_verifier_, rate_limiter,
                                ssl_context_ ? ssl_context_.get() : nullptr)
         ->Run();
 }

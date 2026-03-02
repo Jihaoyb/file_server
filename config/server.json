@@ -9,7 +9,10 @@
       "private_key": "config/ssl/server.key"
     },
     "limits": {
-      "max_body_bytes": 268435456
+      "max_body_bytes": 268435456,
+      "request_timeout_ms": 30000,
+      "rate_limit_rps": 0,
+      "rate_limit_burst": 0
     }
   },
   "storage": {
