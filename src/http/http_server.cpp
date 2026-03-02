@@ -250,6 +250,8 @@ private:
             nebulafs::observability::RecordRateLimited();
             auto response = ErrorResponse(http::status::too_many_requests, parser_->get().version(),
                                           "RATE_LIMITED", "rate limit exceeded", request_id_);
+            // Keep Retry-After deterministic for clients and integration tests.
+            response.set(http::field::retry_after, "1");
             response.keep_alive(false);
             return Send(std::move(response));
         }

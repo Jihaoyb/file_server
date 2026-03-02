@@ -546,14 +546,38 @@ TEST(IntegrationHttp, RateLimiting) {
         ServerProcess server(std::move(handle));
         ASSERT_TRUE(WaitForHealth("127.0.0.1", port));
         std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        auto metrics_before = SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "");
+        ASSERT_EQ(metrics_before.result(), http::status::ok);
+        const auto before_rate_limited =
+            ParseMetricCounter(metrics_before.body(), "nebulafs_http_requests_rate_limited_total");
+        const auto before_timed_out =
+            ParseMetricCounter(metrics_before.body(), "nebulafs_http_requests_timed_out_total");
+        ASSERT_TRUE(before_rate_limited.has_value());
+        ASSERT_TRUE(before_timed_out.has_value());
 
-        auto first = SendRequest(http::verb::get, "127.0.0.1", port, "/healthz", "", "");
-        auto second = SendRequest(http::verb::get, "127.0.0.1", port, "/healthz", "", "");
-        auto third = SendRequest(http::verb::get, "127.0.0.1", port, "/healthz", "", "");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        std::optional<http::response<http::string_body>> rate_limited_response;
+        for (int i = 0; i < 8 && !rate_limited_response.has_value(); ++i) {
+            auto response = SendRequest(http::verb::get, "127.0.0.1", port, "/healthz", "", "");
+            if (response.result() == http::status::too_many_requests) {
+                rate_limited_response = std::move(response);
+            }
+        }
+        ASSERT_TRUE(rate_limited_response.has_value());
+        const auto retry_after = rate_limited_response->find(http::field::retry_after);
+        ASSERT_NE(retry_after, rate_limited_response->end());
+        EXPECT_EQ(retry_after->value(), "1");
 
-        EXPECT_EQ(first.result(), http::status::ok);
-        EXPECT_TRUE(second.result() == http::status::too_many_requests ||
-                    third.result() == http::status::too_many_requests);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        auto metrics_after = SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "");
+        ASSERT_EQ(metrics_after.result(), http::status::ok);
+        const auto after_rate_limited =
+            ParseMetricCounter(metrics_after.body(), "nebulafs_http_requests_rate_limited_total");
+        const auto after_timed_out =
+            ParseMetricCounter(metrics_after.body(), "nebulafs_http_requests_timed_out_total");
+        ASSERT_TRUE(after_rate_limited.has_value());
+        ASSERT_TRUE(after_timed_out.has_value());
+        EXPECT_GT(*after_rate_limited, *before_rate_limited);
     }
 
     CleanupTempDir(temp_dir);
@@ -581,9 +605,12 @@ TEST(IntegrationHttp, RequestTimeout) {
 
         auto metrics_before = SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "");
         ASSERT_EQ(metrics_before.result(), http::status::ok);
-        const auto before_timeout = ParseMetricCounter(metrics_before.body(),
-                                                       "nebulafs_http_requests_timed_out_total")
-                                        .value_or(0);
+        const auto before_timeout =
+            ParseMetricCounter(metrics_before.body(), "nebulafs_http_requests_timed_out_total");
+        const auto before_rate_limited =
+            ParseMetricCounter(metrics_before.body(), "nebulafs_http_requests_rate_limited_total");
+        ASSERT_TRUE(before_timeout.has_value());
+        ASSERT_TRUE(before_rate_limited.has_value());
 
         const std::string payload(8 * 1024 * 1024, 'x');
         bool timeout_observed = false;
@@ -601,9 +628,12 @@ TEST(IntegrationHttp, RequestTimeout) {
         auto metrics_after = SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "");
         ASSERT_EQ(metrics_after.result(), http::status::ok);
         const auto after_timeout =
-            ParseMetricCounter(metrics_after.body(), "nebulafs_http_requests_timed_out_total")
-                .value_or(0);
-        EXPECT_GT(after_timeout, before_timeout);
+            ParseMetricCounter(metrics_after.body(), "nebulafs_http_requests_timed_out_total");
+        const auto after_rate_limited =
+            ParseMetricCounter(metrics_after.body(), "nebulafs_http_requests_rate_limited_total");
+        ASSERT_TRUE(after_timeout.has_value());
+        ASSERT_TRUE(after_rate_limited.has_value());
+        EXPECT_GT(*after_timeout, *before_timeout);
     }
 
     CleanupTempDir(temp_dir);
