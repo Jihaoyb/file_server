@@ -667,14 +667,32 @@ TEST(IntegrationHttp, AuthValidation) {
         auto without_token = SendRequest(http::verb::get, "127.0.0.1", port, "/v1/buckets", "", "");
         EXPECT_EQ(without_token.result(), http::status::unauthorized);
 
+        auto metrics_without_token =
+            SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "");
+        EXPECT_EQ(metrics_without_token.result(), http::status::unauthorized);
+
         auto bad_token = SendRequest(http::verb::get, "127.0.0.1", port, "/v1/buckets", "", "",
                                      {{"Authorization", "Bearer invalid.token"}});
         EXPECT_EQ(bad_token.result(), http::status::unauthorized);
+
+        auto metrics_bad_token = SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "",
+                                             {{"Authorization", "Bearer invalid.token"}});
+        EXPECT_EQ(metrics_bad_token.result(), http::status::unauthorized);
 
         const auto token = MakeValidToken(auth.issuer, auth.audience, kid, key.get());
         auto with_token = SendRequest(http::verb::get, "127.0.0.1", port, "/v1/buckets", "", "",
                                       {{"Authorization", "Bearer " + token}});
         EXPECT_EQ(with_token.result(), http::status::ok);
+
+        auto metrics_with_token = SendRequest(http::verb::get, "127.0.0.1", port, "/metrics", "", "",
+                                              {{"Authorization", "Bearer " + token}});
+        ASSERT_EQ(metrics_with_token.result(), http::status::ok);
+        EXPECT_TRUE(ParseMetricCounter(metrics_with_token.body(),
+                                       "nebulafs_http_requests_rate_limited_total")
+                        .has_value());
+        EXPECT_TRUE(
+            ParseMetricCounter(metrics_with_token.body(), "nebulafs_http_requests_timed_out_total")
+                .has_value());
 
         auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", port, "/v1/buckets",
                                          R"({"name":"authdemo"})", "application/json",
