@@ -379,7 +379,7 @@ private:
     }
 
     bool IsPublicPath(const std::string& path) const {
-        // Keep health endpoints public for liveness checks.
+        // Keep only health endpoints public; /metrics stays protected when auth is enabled.
         return path == "/healthz" || path == "/readyz";
     }
 
