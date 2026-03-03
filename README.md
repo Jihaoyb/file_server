@@ -162,12 +162,13 @@ Troubleshooting:
 - **Milestone 3**: OIDC/JWT validation with JWKS caching (completed).
 - **Milestone 3.1**: Startup auth config hardening (completed).
 - **Milestone 4**: Multipart uploads and cleanup baseline (completed).
-- **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts (in progress).
-- **Milestone 6**: Distributed mode with metadata service and storage nodes.
+- **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts (completed).
+- **Milestone 6**: Distributed mode with metadata service and storage nodes (design in progress).
 
 ## Docs
 - Architecture: `docs/architecture.md`
 - Milestone 4 design: `docs/design/milestone-4-multipart-cleanup.md`
+- Milestone 6 design: `docs/design/milestone-6-distributed-mode.md`
 - Threat model: `docs/threat-model.md`
 - ADRs: `docs/adr/`
 - Code style: `docs/code-style.md`
