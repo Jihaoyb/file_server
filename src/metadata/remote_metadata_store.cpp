@@ -11,6 +11,12 @@
 
 #include "nebulafs/distributed/http_client.h"
 
+// Poco pulls in Windows headers on win32, which define GetObject as a macro.
+// Remove the macro before member definitions to avoid GetObject->GetObjectW rewrite.
+#ifdef GetObject
+#undef GetObject
+#endif
+
 namespace nebulafs::metadata {
 namespace {
 

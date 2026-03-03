@@ -7,6 +7,12 @@
 #include "nebulafs/core/error.h"
 #include "nebulafs/core/result.h"
 
+// Windows headers define GetObject as a macro (GetObjectW/A). Undefine it here to
+// keep metadata interface method names stable across platforms.
+#ifdef GetObject
+#undef GetObject
+#endif
+
 namespace nebulafs::metadata {
 
 /// @brief Bucket metadata record.
