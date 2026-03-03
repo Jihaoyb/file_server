@@ -71,6 +71,13 @@ core::Result<StoredObject> LocalStorage::WriteObject(const std::string& bucket,
         total += static_cast<std::uint64_t>(bytes);
     }
     out.flush();
+    if (!out.good()) {
+        return core::Error{core::ErrorCode::kIoError, "failed to flush temp file"};
+    }
+    out.close();
+    if (!out.good()) {
+        return core::Error{core::ErrorCode::kIoError, "failed to close temp file"};
+    }
 #else
     const int fd = ::open(temp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
@@ -95,8 +102,15 @@ core::Result<StoredObject> LocalStorage::WriteObject(const std::string& bucket,
     ::close(fd);
 #endif
 
-    std::filesystem::create_directories(std::filesystem::path(final_path).parent_path());
-    std::filesystem::rename(temp_path, final_path);
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(final_path).parent_path(), ec);
+    if (ec) {
+        return core::Error{core::ErrorCode::kIoError, "failed to create object directory"};
+    }
+    std::filesystem::rename(temp_path, final_path, ec);
+    if (ec) {
+        return core::Error{core::ErrorCode::kIoError, "failed to finalize object write"};
+    }
 
     StoredObject stored;
     stored.path = final_path;
