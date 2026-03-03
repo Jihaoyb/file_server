@@ -40,3 +40,29 @@ jobs:
         run: cmake --build --preset debug
       - name: Test
         run: ctest --preset debug
+
+  distributed-ubuntu:
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg_cache
+      NEBULAFS_ENABLE_DISTRIBUTED_IT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_cache
+          key: ubuntu-latest-vcpkg-${{ hashFiles('**/vcpkg.json') }}
+          restore-keys: ubuntu-latest-vcpkg-
+      - name: Install vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 01e159b519b7e791cc5bb3548663a26d9c0922a3
+      - name: Configure
+        run: cmake --preset debug
+      - name: Build
+        run: cmake --build --preset debug
+      - name: Distributed integration test lane
+        env:
+          NEBULAFS_ENABLE_DISTRIBUTED_IT: "1"
+        run: ctest --preset debug --output-on-failure -R nebulafs_integration_tests

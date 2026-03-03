@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -157,6 +158,140 @@ std::filesystem::path WriteServerConfig(const std::filesystem::path& dir,
         << "    \"cache_ttl_seconds\": " << auth.cache_ttl_seconds << ",\n"
         << "    \"clock_skew_seconds\": " << auth.clock_skew_seconds << ",\n"
         << "    \"allowed_alg\": \"" << auth.allowed_alg << "\"\n"
+        << "  }\n"
+        << "}\n";
+    return config_path;
+}
+
+std::string ToJsonArray(const std::vector<std::string>& values) {
+    std::ostringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            ss << ",";
+        }
+        ss << "\"" << values[i] << "\"";
+    }
+    ss << "]";
+    return ss.str();
+}
+
+std::filesystem::path WriteGatewayDistributedConfig(const std::filesystem::path& dir,
+                                                    unsigned short port,
+                                                    const std::string& metadata_base_url,
+                                                    const std::vector<std::string>& storage_nodes,
+                                                    const std::string& token) {
+    const auto storage_dir = dir / "storage";
+    const auto temp_dir = storage_dir / "tmp";
+    std::filesystem::create_directories(temp_dir);
+
+    const auto config_path = dir / "server.json";
+    std::ofstream out(config_path);
+    out << "{\n"
+        << "  \"server\": {\n"
+        << "    \"host\": \"127.0.0.1\",\n"
+        << "    \"port\": " << port << ",\n"
+        << "    \"threads\": 1,\n"
+        << "    \"mode\": \"distributed\",\n"
+        << "    \"tls\": {\"enabled\": false, \"certificate\": \"\", \"private_key\": \"\"},\n"
+        << "    \"limits\": {\n"
+        << "      \"max_body_bytes\": 10485760,\n"
+        << "      \"request_timeout_ms\": 30000,\n"
+        << "      \"rate_limit_rps\": 0,\n"
+        << "      \"rate_limit_burst\": 0\n"
+        << "    }\n"
+        << "  },\n"
+        << "  \"storage\": {\n"
+        << "    \"base_path\": \"" << storage_dir.generic_string() << "\",\n"
+        << "    \"temp_path\": \"" << temp_dir.generic_string() << "\"\n"
+        << "  },\n"
+        << "  \"cleanup\": {\"enabled\": false, \"sweep_interval_seconds\": 300, "
+           "\"grace_period_seconds\": 60, \"max_uploads_per_sweep\": 200},\n"
+        << "  \"observability\": {\"log_level\": \"warning\"},\n"
+        << "  \"auth\": {\"enabled\": false, \"issuer\": \"\", \"audience\": \"\", "
+           "\"jwks_url\": \"\", \"cache_ttl_seconds\": 300, \"clock_skew_seconds\": 60, "
+           "\"allowed_alg\": \"RS256\"},\n"
+        << "  \"distributed\": {\n"
+        << "    \"metadata_base_url\": \"" << metadata_base_url << "\",\n"
+        << "    \"storage_nodes\": " << ToJsonArray(storage_nodes) << ",\n"
+        << "    \"service_auth_token\": \"" << token << "\",\n"
+        << "    \"replication_factor\": 2,\n"
+        << "    \"min_write_acks\": 2\n"
+        << "  }\n"
+        << "}\n";
+    return config_path;
+}
+
+std::filesystem::path WriteMetadataServiceConfig(const std::filesystem::path& dir,
+                                                 unsigned short port,
+                                                 const std::string& token,
+                                                 const std::vector<std::string>& storage_nodes) {
+    std::filesystem::create_directories(dir);
+    const auto config_path = dir / "metadata_server.json";
+    std::ofstream out(config_path);
+    out << "{\n"
+        << "  \"server\": {\n"
+        << "    \"host\": \"127.0.0.1\",\n"
+        << "    \"port\": " << port << ",\n"
+        << "    \"threads\": 1,\n"
+        << "    \"mode\": \"single_node\",\n"
+        << "    \"tls\": {\"enabled\": false, \"certificate\": \"\", \"private_key\": \"\"},\n"
+        << "    \"limits\": {\"max_body_bytes\": 1048576, \"request_timeout_ms\": 30000, "
+           "\"rate_limit_rps\": 0, \"rate_limit_burst\": 0}\n"
+        << "  },\n"
+        << "  \"storage\": {\"base_path\": \"data\", \"temp_path\": \"data/tmp\"},\n"
+        << "  \"cleanup\": {\"enabled\": false, \"sweep_interval_seconds\": 300, "
+           "\"grace_period_seconds\": 60, \"max_uploads_per_sweep\": 200},\n"
+        << "  \"observability\": {\"log_level\": \"warning\"},\n"
+        << "  \"auth\": {\"enabled\": false, \"issuer\": \"\", \"audience\": \"\", "
+           "\"jwks_url\": \"\", \"cache_ttl_seconds\": 300, \"clock_skew_seconds\": 60, "
+           "\"allowed_alg\": \"RS256\"},\n"
+        << "  \"distributed\": {\n"
+        << "    \"metadata_base_url\": \"\",\n"
+        << "    \"storage_nodes\": " << ToJsonArray(storage_nodes) << ",\n"
+        << "    \"service_auth_token\": \"" << token << "\",\n"
+        << "    \"replication_factor\": 2,\n"
+        << "    \"min_write_acks\": 2\n"
+        << "  }\n"
+        << "}\n";
+    return config_path;
+}
+
+std::filesystem::path WriteStorageNodeConfig(const std::filesystem::path& dir,
+                                             unsigned short port,
+                                             const std::string& token) {
+    const auto storage_dir = dir / "storage";
+    const auto temp_dir = storage_dir / "tmp";
+    std::filesystem::create_directories(temp_dir);
+
+    const auto config_path = dir / "storage_node_server.json";
+    std::ofstream out(config_path);
+    out << "{\n"
+        << "  \"server\": {\n"
+        << "    \"host\": \"127.0.0.1\",\n"
+        << "    \"port\": " << port << ",\n"
+        << "    \"threads\": 1,\n"
+        << "    \"mode\": \"single_node\",\n"
+        << "    \"tls\": {\"enabled\": false, \"certificate\": \"\", \"private_key\": \"\"},\n"
+        << "    \"limits\": {\"max_body_bytes\": 10485760, \"request_timeout_ms\": 30000, "
+           "\"rate_limit_rps\": 0, \"rate_limit_burst\": 0}\n"
+        << "  },\n"
+        << "  \"storage\": {\n"
+        << "    \"base_path\": \"" << storage_dir.generic_string() << "\",\n"
+        << "    \"temp_path\": \"" << temp_dir.generic_string() << "\"\n"
+        << "  },\n"
+        << "  \"cleanup\": {\"enabled\": false, \"sweep_interval_seconds\": 300, "
+           "\"grace_period_seconds\": 60, \"max_uploads_per_sweep\": 200},\n"
+        << "  \"observability\": {\"log_level\": \"warning\"},\n"
+        << "  \"auth\": {\"enabled\": false, \"issuer\": \"\", \"audience\": \"\", "
+           "\"jwks_url\": \"\", \"cache_ttl_seconds\": 300, \"clock_skew_seconds\": 60, "
+           "\"allowed_alg\": \"RS256\"},\n"
+        << "  \"distributed\": {\n"
+        << "    \"metadata_base_url\": \"\",\n"
+        << "    \"storage_nodes\": [],\n"
+        << "    \"service_auth_token\": \"" << token << "\",\n"
+        << "    \"replication_factor\": 2,\n"
+        << "    \"min_write_acks\": 2\n"
         << "  }\n"
         << "}\n";
     return config_path;
@@ -634,6 +769,82 @@ TEST(IntegrationHttp, RequestTimeout) {
         ASSERT_TRUE(after_timeout.has_value());
         ASSERT_TRUE(after_rate_limited.has_value());
         EXPECT_GT(*after_timeout, *before_timeout);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, DistributedCrudSmoke) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto gateway_port = FindFreePort();
+    const auto metadata_port = FindFreePort();
+    const auto storage1_port = FindFreePort();
+    const auto storage2_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage1_port),
+        "http://127.0.0.1:" + std::to_string(storage2_port),
+    };
+    const auto metadata_url = "http://127.0.0.1:" + std::to_string(metadata_port);
+
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage1_config = WriteStorageNodeConfig(temp_dir / "storage1", storage1_port, token);
+    const auto storage2_config = WriteStorageNodeConfig(temp_dir / "storage2", storage2_port, token);
+    const auto gateway_config = WriteGatewayDistributedConfig(temp_dir / "gateway", gateway_port,
+                                                              metadata_url, storage_nodes, token);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage1_args = {"--config", storage1_config.string()};
+    std::vector<std::string> storage2_args = {"--config", storage2_config.string()};
+    std::vector<std::string> gateway_args = {"--config", gateway_config.string(), "--database",
+                                             metadata_db.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage1_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage1_args);
+    auto storage2_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage2_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage1(std::move(storage1_handle));
+        ServerProcess storage2(std::move(storage2_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage1_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage2_port));
+
+        auto gateway_handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, gateway_args);
+        ServerProcess gateway(std::move(gateway_handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", gateway_port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", gateway_port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto upload = SendRequest(http::verb::put, "127.0.0.1", gateway_port,
+                                  "/v1/buckets/demo/objects/readme.txt", "distributed-data", "");
+        ASSERT_EQ(upload.result(), http::status::ok);
+
+        auto list = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                "/v1/buckets/demo/objects?prefix=read", "", "");
+        ASSERT_EQ(list.result(), http::status::ok);
+        EXPECT_NE(list.body().find("\"readme.txt\""), std::string::npos);
+
+        auto download = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/objects/readme.txt", "", "");
+        ASSERT_EQ(download.result(), http::status::ok);
+        EXPECT_EQ(download.body(), "distributed-data");
+
+        auto del = SendRequest(http::verb::delete_, "127.0.0.1", gateway_port,
+                               "/v1/buckets/demo/objects/readme.txt", "", "");
+        ASSERT_EQ(del.result(), http::status::ok);
     }
 
     CleanupTempDir(temp_dir);

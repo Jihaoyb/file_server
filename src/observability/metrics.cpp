@@ -11,6 +11,9 @@ std::atomic<std::uint64_t> g_requests_5xx{0};
 std::atomic<std::uint64_t> g_latency_ms_total{0};
 std::atomic<std::uint64_t> g_rate_limited_total{0};
 std::atomic<std::uint64_t> g_timed_out_total{0};
+std::atomic<std::uint64_t> g_gateway_storage_put_failures_total{0};
+std::atomic<std::uint64_t> g_gateway_metadata_rpc_failures_total{0};
+std::atomic<std::uint64_t> g_gateway_replica_fallback_total{0};
 }  // namespace
 
 void RecordRequest(int status_code, long long latency_ms) {
@@ -29,6 +32,18 @@ void RecordRequest(int status_code, long long latency_ms) {
 void RecordRateLimited() { g_rate_limited_total.fetch_add(1, std::memory_order_relaxed); }
 
 void RecordTimedOut() { g_timed_out_total.fetch_add(1, std::memory_order_relaxed); }
+
+void RecordGatewayStoragePutFailure() {
+    g_gateway_storage_put_failures_total.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordGatewayMetadataRpcFailure() {
+    g_gateway_metadata_rpc_failures_total.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordGatewayReplicaFallback() {
+    g_gateway_replica_fallback_total.fetch_add(1, std::memory_order_relaxed);
+}
 
 std::string RenderMetrics() {
     const auto total = g_total_requests.load(std::memory_order_relaxed);
@@ -61,7 +76,21 @@ std::string RenderMetrics() {
            "# HELP nebulafs_http_requests_timed_out_total Total requests timed out\n"
            "# TYPE nebulafs_http_requests_timed_out_total counter\n"
            "nebulafs_http_requests_timed_out_total " +
-           std::to_string(g_timed_out_total.load(std::memory_order_relaxed)) + "\n";
+           std::to_string(g_timed_out_total.load(std::memory_order_relaxed)) + "\n"
+           "# HELP nebulafs_gateway_storage_put_failures_total Total distributed storage PUT failures\n"
+           "# TYPE nebulafs_gateway_storage_put_failures_total counter\n"
+           "nebulafs_gateway_storage_put_failures_total " +
+           std::to_string(g_gateway_storage_put_failures_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_gateway_metadata_rpc_failures_total Total distributed metadata RPC failures\n"
+           "# TYPE nebulafs_gateway_metadata_rpc_failures_total counter\n"
+           "nebulafs_gateway_metadata_rpc_failures_total " +
+           std::to_string(g_gateway_metadata_rpc_failures_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_gateway_replica_fallback_total Total distributed read fallback events\n"
+           "# TYPE nebulafs_gateway_replica_fallback_total counter\n"
+           "nebulafs_gateway_replica_fallback_total " +
+           std::to_string(g_gateway_replica_fallback_total.load(std::memory_order_relaxed)) + "\n";
 }
 
 }  // namespace nebulafs::observability

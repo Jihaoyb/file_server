@@ -89,7 +89,7 @@ HttpResponse JsonError(int version, const std::string& code, const std::string& 
     return response;
 }
 
-core::Result<void> ValidateUploadForBucket(metadata::MetadataStore* metadata,
+core::Result<void> ValidateUploadForBucket(metadata::MetadataBackend* metadata,
                                            const std::string& bucket, const std::string& upload_id,
                                            int* bucket_id_out,
                                            metadata::MultipartUpload* upload_out) {
@@ -155,8 +155,8 @@ core::Result<std::vector<CompletePart>> ParseCompleteParts(const std::string& bo
 
 }  // namespace
 
-void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataStore> metadata,
-                           std::shared_ptr<storage::LocalStorage> storage,
+void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataBackend> metadata,
+                           std::shared_ptr<storage::StorageBackend> storage,
                            const core::Config& config) {
     router.Add("GET", "/healthz",
                [](const RequestContext& ctx, const HttpRequest& req, const RouteParams&) {
@@ -252,7 +252,8 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataSto
                    return JsonOk(req.version(), ss.str());
                });
 
-    router.Add("POST", "/v1/buckets/{bucket}/multipart-uploads",
+    if (config.server.mode == "single_node") {
+        router.Add("POST", "/v1/buckets/{bucket}/multipart-uploads",
                [metadata,
                 ttl_seconds = config.storage.multipart.max_upload_ttl_seconds](
                    const RequestContext& ctx, const HttpRequest& req,
@@ -542,7 +543,7 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataSto
                                      std::to_string(object_meta.size_bytes) + "}");
                });
 
-    router.Add("DELETE", "/v1/buckets/{bucket}/multipart-uploads/{upload_id}",
+        router.Add("DELETE", "/v1/buckets/{bucket}/multipart-uploads/{upload_id}",
                [metadata, storage](const RequestContext& ctx, const HttpRequest& req,
                                    const RouteParams& params) {
                    const auto bucket = params.at("bucket");
@@ -571,6 +572,7 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataSto
                    HttpResponse response{boost::beast::http::status::no_content, req.version()};
                    return response;
                });
+    }
 
     router.Add("DELETE", "/v1/buckets/{bucket}/objects/{object}",
                [metadata, storage](const RequestContext& ctx, const HttpRequest& req,

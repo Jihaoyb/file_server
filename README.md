@@ -39,6 +39,17 @@ cmake --build --preset debug
 ./build/debug/nebulafs --config config/server.json
 ```
 
+### Distributed mode binaries
+Milestone 6 adds two internal services:
+- `./build/debug/nebulafs_metadata` (metadata + placement service)
+- `./build/debug/nebulafs_storage_node` (blob storage node)
+
+Gateway distributed mode is enabled with:
+- `server.mode = "distributed"`
+- `distributed.metadata_base_url`
+- `distributed.storage_nodes`
+- `distributed.service_auth_token`
+
 ### Traffic controls
 `config/server.json` supports:
 - `server.limits.request_timeout_ms` (default `30000`)
@@ -93,6 +104,8 @@ curl http://localhost:8080/v1/buckets/demo/objects/readme.txt -o readme.txt
 # List objects
 curl "http://localhost:8080/v1/buckets/demo/objects?prefix=read"
 ```
+
+Note: multipart upload endpoints are currently single-node only; distributed mode focuses on object CRUD baseline in Milestone 6.
 
 ### Authentication test (Keycloak local)
 

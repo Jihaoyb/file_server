@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace nebulafs::core {
 
@@ -25,6 +26,7 @@ struct ServerConfig {
     std::string host{"0.0.0.0"};
     int port{8080};
     int threads{4};
+    std::string mode{"single_node"};
     TlsConfig tls;
     LimitsConfig limits;
 };
@@ -65,6 +67,15 @@ struct AuthConfig {
     std::string allowed_alg{"RS256"};
 };
 
+/// @brief Distributed mode connection and quorum settings.
+struct DistributedConfig {
+    std::string metadata_base_url;
+    std::vector<std::string> storage_nodes;
+    std::string service_auth_token;
+    int replication_factor{2};
+    int min_write_acks{2};
+};
+
 /// @brief Top-level configuration for NebulaFS.
 struct Config {
     ServerConfig server;
@@ -72,6 +83,7 @@ struct Config {
     CleanupJobConfig cleanup;
     ObservabilityConfig observability;
     AuthConfig auth;
+    DistributedConfig distributed;
 };
 
 /// @brief Load server configuration from a JSON file.

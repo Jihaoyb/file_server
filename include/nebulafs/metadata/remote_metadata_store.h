@@ -1,18 +1,15 @@
 #pragma once
 
-#include <cstdint>
 #include <string>
-
-#include <Poco/Data/Session.h>
 
 #include "nebulafs/metadata/metadata_store.h"
 
 namespace nebulafs::metadata {
 
-/// @brief SQLite-backed metadata store for single-node mode.
-class SqliteMetadataStore : public MetadataStore {
+/// @brief HTTP-backed metadata store client for distributed mode.
+class RemoteMetadataStore : public MetadataStore {
 public:
-    explicit SqliteMetadataStore(const std::string& db_path);
+    RemoteMetadataStore(std::string base_url, std::string service_auth_token);
 
     core::Result<Bucket> CreateBucket(const std::string& name) override;
     core::Result<std::vector<Bucket>> ListBuckets() override;
@@ -23,7 +20,7 @@ public:
     core::Result<ObjectMetadata> GetObject(const std::string& bucket,
                                            const std::string& object) override;
     core::Result<std::vector<ObjectMetadata>> ListObjects(const std::string& bucket,
-                                                           const std::string& prefix) override;
+                                                          const std::string& prefix) override;
     core::Result<void> DeleteObject(const std::string& bucket,
                                     const std::string& object) override;
 
@@ -37,7 +34,6 @@ public:
     core::Result<void> UpdateMultipartUploadState(const std::string& upload_id,
                                                   const std::string& state) override;
     core::Result<void> DeleteMultipartUpload(const std::string& upload_id) override;
-
     core::Result<MultipartPart> UpsertMultipartPart(const std::string& upload_id,
                                                     int part_number,
                                                     std::uint64_t size_bytes,
@@ -63,9 +59,8 @@ public:
                                               const std::string& object_name) override;
 
 private:
-    // Schema creation is done once per store instance; in production this will be migrated.
-    void InitSchema();
-    Poco::Data::Session session_;
+    std::string base_url_;
+    std::string service_auth_token_;
 };
 
 }  // namespace nebulafs::metadata

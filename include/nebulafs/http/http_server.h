@@ -10,8 +10,8 @@
 #include "nebulafs/core/config.h"
 #include "nebulafs/auth/jwt_verifier.h"
 #include "nebulafs/http/router.h"
-#include "nebulafs/metadata/metadata_store.h"
-#include "nebulafs/storage/local_storage.h"
+#include "nebulafs/metadata/metadata_backend.h"
+#include "nebulafs/storage/storage_backend.h"
 
 namespace nebulafs::http {
 
@@ -19,8 +19,8 @@ namespace nebulafs::http {
 class HttpServer {
 public:
     HttpServer(boost::asio::io_context& ioc, const core::Config& config, Router router,
-               std::shared_ptr<storage::LocalStorage> storage,
-               std::shared_ptr<metadata::MetadataStore> metadata);
+               std::shared_ptr<storage::StorageBackend> storage,
+               std::shared_ptr<metadata::MetadataBackend> metadata);
     void Run();
 
 private:
@@ -31,8 +31,8 @@ private:
     boost::asio::io_context& ioc_;
     core::Config config_;
     Router router_;
-    std::shared_ptr<storage::LocalStorage> storage_;
-    std::shared_ptr<metadata::MetadataStore> metadata_;
+    std::shared_ptr<storage::StorageBackend> storage_;
+    std::shared_ptr<metadata::MetadataBackend> metadata_;
     std::shared_ptr<auth::JwtVerifier> auth_verifier_;
     std::unique_ptr<boost::asio::ssl::context> ssl_context_;
     std::unique_ptr<boost::asio::steady_timer> cleanup_timer_;
