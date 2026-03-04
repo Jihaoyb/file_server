@@ -58,7 +58,12 @@ class ServerProcess {
 public:
     explicit ServerProcess(Poco::ProcessHandle handle) : handle_(std::move(handle)) {}
 
-    ~ServerProcess() {
+    ~ServerProcess() { Stop(); }
+
+    void Stop() {
+        if (stopped_) {
+            return;
+        }
         try {
             if (Poco::Process::isRunning(handle_)) {
                 Poco::Process::kill(handle_);
@@ -67,6 +72,7 @@ public:
         } catch (const std::exception&) {
             // Best-effort shutdown; test cleanup should not throw.
         }
+        stopped_ = true;
     }
 
     ServerProcess(const ServerProcess&) = delete;
@@ -74,6 +80,7 @@ public:
 
 private:
     Poco::ProcessHandle handle_;
+    bool stopped_{false};
 };
 
 unsigned short FindFreePort() {
@@ -176,11 +183,18 @@ std::string ToJsonArray(const std::vector<std::string>& values) {
     return ss.str();
 }
 
+struct DistributedGatewayConfigOptions {
+    int replication_factor{2};
+    int min_write_acks{2};
+};
+
 std::filesystem::path WriteGatewayDistributedConfig(const std::filesystem::path& dir,
                                                     unsigned short port,
                                                     const std::string& metadata_base_url,
                                                     const std::vector<std::string>& storage_nodes,
-                                                    const std::string& token) {
+                                                    const std::string& token,
+                                                    const DistributedGatewayConfigOptions& options =
+                                                        {}) {
     const auto storage_dir = dir / "storage";
     const auto temp_dir = storage_dir / "tmp";
     std::filesystem::create_directories(temp_dir);
@@ -215,8 +229,8 @@ std::filesystem::path WriteGatewayDistributedConfig(const std::filesystem::path&
         << "    \"metadata_base_url\": \"" << metadata_base_url << "\",\n"
         << "    \"storage_nodes\": " << ToJsonArray(storage_nodes) << ",\n"
         << "    \"service_auth_token\": \"" << token << "\",\n"
-        << "    \"replication_factor\": 2,\n"
-        << "    \"min_write_acks\": 2\n"
+        << "    \"replication_factor\": " << options.replication_factor << ",\n"
+        << "    \"min_write_acks\": " << options.min_write_acks << "\n"
         << "  }\n"
         << "}\n";
     return config_path;
@@ -845,6 +859,243 @@ TEST(IntegrationHttp, DistributedCrudSmoke) {
         auto del = SendRequest(http::verb::delete_, "127.0.0.1", gateway_port,
                                "/v1/buckets/demo/objects/readme.txt", "", "");
         ASSERT_EQ(del.result(), http::status::ok);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, DistributedReadFallbackWhenPrimaryDown) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto gateway_port = FindFreePort();
+    const auto metadata_port = FindFreePort();
+    const auto storage1_port = FindFreePort();
+    const auto storage2_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage1_port),
+        "http://127.0.0.1:" + std::to_string(storage2_port),
+    };
+    const auto metadata_url = "http://127.0.0.1:" + std::to_string(metadata_port);
+
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage1_config = WriteStorageNodeConfig(temp_dir / "storage1", storage1_port, token);
+    const auto storage2_config = WriteStorageNodeConfig(temp_dir / "storage2", storage2_port, token);
+    const auto gateway_config = WriteGatewayDistributedConfig(temp_dir / "gateway", gateway_port,
+                                                              metadata_url, storage_nodes, token);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage1_args = {"--config", storage1_config.string()};
+    std::vector<std::string> storage2_args = {"--config", storage2_config.string()};
+    std::vector<std::string> gateway_args = {"--config", gateway_config.string(), "--database",
+                                             metadata_db.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage1_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage1_args);
+    auto storage2_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage2_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage1(std::move(storage1_handle));
+        ServerProcess storage2(std::move(storage2_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage1_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage2_port));
+
+        auto gateway_handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, gateway_args);
+        ServerProcess gateway(std::move(gateway_handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", gateway_port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", gateway_port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto upload = SendRequest(http::verb::put, "127.0.0.1", gateway_port,
+                                  "/v1/buckets/demo/objects/readme.txt", "distributed-data", "");
+        ASSERT_EQ(upload.result(), http::status::ok);
+
+        auto metrics_before = SendRequest(http::verb::get, "127.0.0.1", gateway_port, "/metrics",
+                                          "", "");
+        ASSERT_EQ(metrics_before.result(), http::status::ok);
+        const auto before_fallback =
+            ParseMetricCounter(metrics_before.body(), "nebulafs_gateway_replica_fallback_total");
+        ASSERT_TRUE(before_fallback.has_value());
+
+        // Force primary replica failure and verify read falls back to secondary.
+        storage1.Stop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        auto download = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/objects/readme.txt", "", "");
+        ASSERT_EQ(download.result(), http::status::ok);
+        EXPECT_EQ(download.body(), "distributed-data");
+
+        auto metrics_after = SendRequest(http::verb::get, "127.0.0.1", gateway_port, "/metrics", "",
+                                         "");
+        ASSERT_EQ(metrics_after.result(), http::status::ok);
+        const auto after_fallback =
+            ParseMetricCounter(metrics_after.body(), "nebulafs_gateway_replica_fallback_total");
+        ASSERT_TRUE(after_fallback.has_value());
+        EXPECT_GT(*after_fallback, *before_fallback);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, DistributedWriteQuorumFailureKeepsObjectInvisible) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto gateway_port = FindFreePort();
+    const auto metadata_port = FindFreePort();
+    const auto storage1_port = FindFreePort();
+    const auto storage2_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage1_port),
+        "http://127.0.0.1:" + std::to_string(storage2_port),
+    };
+    const auto metadata_url = "http://127.0.0.1:" + std::to_string(metadata_port);
+
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage1_config = WriteStorageNodeConfig(temp_dir / "storage1", storage1_port, token);
+    DistributedGatewayConfigOptions options;
+    options.replication_factor = 2;
+    options.min_write_acks = 2;
+    const auto gateway_config = WriteGatewayDistributedConfig(
+        temp_dir / "gateway", gateway_port, metadata_url, storage_nodes, token, options);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage1_args = {"--config", storage1_config.string()};
+    std::vector<std::string> gateway_args = {"--config", gateway_config.string(), "--database",
+                                             metadata_db.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage1_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage1_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage1(std::move(storage1_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage1_port));
+
+        // Intentionally do not start storage2 to force quorum failure.
+        auto gateway_handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, gateway_args);
+        ServerProcess gateway(std::move(gateway_handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", gateway_port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", gateway_port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto metrics_before = SendRequest(http::verb::get, "127.0.0.1", gateway_port, "/metrics",
+                                          "", "");
+        ASSERT_EQ(metrics_before.result(), http::status::ok);
+        const auto before_storage_failures = ParseMetricCounter(
+            metrics_before.body(), "nebulafs_gateway_storage_put_failures_total");
+        ASSERT_TRUE(before_storage_failures.has_value());
+
+        auto upload = SendRequest(http::verb::put, "127.0.0.1", gateway_port,
+                                  "/v1/buckets/demo/objects/readme.txt", "distributed-data", "");
+        ASSERT_EQ(upload.result(), http::status::internal_server_error);
+        EXPECT_NE(upload.body().find("insufficient storage node write acknowledgements"),
+                  std::string::npos);
+
+        auto metrics_after = SendRequest(http::verb::get, "127.0.0.1", gateway_port, "/metrics", "",
+                                         "");
+        ASSERT_EQ(metrics_after.result(), http::status::ok);
+        const auto after_storage_failures =
+            ParseMetricCounter(metrics_after.body(), "nebulafs_gateway_storage_put_failures_total");
+        ASSERT_TRUE(after_storage_failures.has_value());
+        EXPECT_GT(*after_storage_failures, *before_storage_failures);
+
+        auto missing = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                   "/v1/buckets/demo/objects/readme.txt", "", "");
+        EXPECT_EQ(missing.result(), http::status::not_found);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, DistributedInternalEndpointsRejectInvalidServiceToken) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto metadata_port = FindFreePort();
+    const auto storage_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage_port),
+    };
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage_config = WriteStorageNodeConfig(temp_dir / "storage", storage_port, token);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage_args = {"--config", storage_config.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage(std::move(storage_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage_port));
+
+        auto metadata_no_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
+                                             "/internal/v1/buckets/list", "", "");
+        EXPECT_EQ(metadata_no_token.result(), http::status::unauthorized);
+
+        auto metadata_bad_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
+                                              "/internal/v1/buckets/list", "", "",
+                                              {{"Authorization", "Bearer wrong-token"}});
+        EXPECT_EQ(metadata_bad_token.result(), http::status::unauthorized);
+
+        auto metadata_good_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
+                                               "/internal/v1/buckets/list", "", "",
+                                               {{"Authorization", "Bearer " + token}});
+        EXPECT_EQ(metadata_good_token.result(), http::status::ok);
+
+        auto storage_no_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
+                                            "/internal/v1/blobs/test-blob", "", "");
+        EXPECT_EQ(storage_no_token.result(), http::status::unauthorized);
+
+        auto storage_bad_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
+                                             "/internal/v1/blobs/test-blob", "", "",
+                                             {{"Authorization", "Bearer wrong-token"}});
+        EXPECT_EQ(storage_bad_token.result(), http::status::unauthorized);
+
+        auto storage_good_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
+                                              "/internal/v1/blobs/test-blob", "", "",
+                                              {{"Authorization", "Bearer " + token}});
+        EXPECT_EQ(storage_good_token.result(), http::status::not_found);
+
+        auto storage_missing_placement = SendRequest(
+            http::verb::put, "127.0.0.1", storage_port, "/internal/v1/blobs/test-blob", "abc",
+            "application/octet-stream", {{"Authorization", "Bearer " + token}});
+        EXPECT_EQ(storage_missing_placement.result(), http::status::unauthorized);
     }
 
     CleanupTempDir(temp_dir);
