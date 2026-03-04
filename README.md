@@ -50,6 +50,31 @@ Gateway distributed mode is enabled with:
 - `distributed.storage_nodes`
 - `distributed.service_auth_token`
 
+### Distributed observability metrics (Milestone 6)
+Distributed mode now emits service-specific counters and latency sums via `/metrics`.
+
+- Gateway:
+  - `nebulafs_gateway_storage_put_failures_total`
+  - `nebulafs_gateway_metadata_rpc_failures_total`
+  - `nebulafs_gateway_replica_fallback_total`
+- Metadata service:
+  - `nebulafs_metadata_allocate_requests_total`
+  - `nebulafs_metadata_allocate_failures_total`
+  - `nebulafs_metadata_allocate_latency_ms_sum`
+  - `nebulafs_metadata_commit_requests_total`
+  - `nebulafs_metadata_commit_failures_total`
+  - `nebulafs_metadata_commit_latency_ms_sum`
+- Storage node service:
+  - `nebulafs_storage_node_blob_writes_total`
+  - `nebulafs_storage_node_blob_write_failures_total`
+  - `nebulafs_storage_node_blob_write_latency_ms_sum`
+  - `nebulafs_storage_node_blob_reads_total`
+  - `nebulafs_storage_node_blob_read_failures_total`
+  - `nebulafs_storage_node_blob_read_latency_ms_sum`
+  - `nebulafs_storage_node_blob_deletes_total`
+  - `nebulafs_storage_node_blob_delete_failures_total`
+  - `nebulafs_storage_node_blob_delete_latency_ms_sum`
+
 ### Traffic controls
 `config/server.json` supports:
 - `server.limits.request_timeout_ms` (default `30000`)
