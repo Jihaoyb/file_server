@@ -1,6 +1,7 @@
 #include "nebulafs/observability/metrics.h"
 
 #include <atomic>
+#include <cstdint>
 
 namespace nebulafs::observability {
 namespace {
@@ -14,6 +15,21 @@ std::atomic<std::uint64_t> g_timed_out_total{0};
 std::atomic<std::uint64_t> g_gateway_storage_put_failures_total{0};
 std::atomic<std::uint64_t> g_gateway_metadata_rpc_failures_total{0};
 std::atomic<std::uint64_t> g_gateway_replica_fallback_total{0};
+std::atomic<std::uint64_t> g_metadata_allocate_requests_total{0};
+std::atomic<std::uint64_t> g_metadata_allocate_failures_total{0};
+std::atomic<std::uint64_t> g_metadata_allocate_latency_ms_sum{0};
+std::atomic<std::uint64_t> g_metadata_commit_requests_total{0};
+std::atomic<std::uint64_t> g_metadata_commit_failures_total{0};
+std::atomic<std::uint64_t> g_metadata_commit_latency_ms_sum{0};
+std::atomic<std::uint64_t> g_storage_node_blob_writes_total{0};
+std::atomic<std::uint64_t> g_storage_node_blob_write_failures_total{0};
+std::atomic<std::uint64_t> g_storage_node_blob_write_latency_ms_sum{0};
+std::atomic<std::uint64_t> g_storage_node_blob_reads_total{0};
+std::atomic<std::uint64_t> g_storage_node_blob_read_failures_total{0};
+std::atomic<std::uint64_t> g_storage_node_blob_read_latency_ms_sum{0};
+std::atomic<std::uint64_t> g_storage_node_blob_deletes_total{0};
+std::atomic<std::uint64_t> g_storage_node_blob_delete_failures_total{0};
+std::atomic<std::uint64_t> g_storage_node_blob_delete_latency_ms_sum{0};
 }  // namespace
 
 void RecordRequest(int status_code, long long latency_ms) {
@@ -43,6 +59,51 @@ void RecordGatewayMetadataRpcFailure() {
 
 void RecordGatewayReplicaFallback() {
     g_gateway_replica_fallback_total.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordMetadataAllocate(bool success, long long latency_ms) {
+    g_metadata_allocate_requests_total.fetch_add(1, std::memory_order_relaxed);
+    g_metadata_allocate_latency_ms_sum.fetch_add(static_cast<std::uint64_t>(latency_ms),
+                                                 std::memory_order_relaxed);
+    if (!success) {
+        g_metadata_allocate_failures_total.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void RecordMetadataCommit(bool success, long long latency_ms) {
+    g_metadata_commit_requests_total.fetch_add(1, std::memory_order_relaxed);
+    g_metadata_commit_latency_ms_sum.fetch_add(static_cast<std::uint64_t>(latency_ms),
+                                               std::memory_order_relaxed);
+    if (!success) {
+        g_metadata_commit_failures_total.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void RecordStorageNodeWrite(bool success, long long latency_ms) {
+    g_storage_node_blob_writes_total.fetch_add(1, std::memory_order_relaxed);
+    g_storage_node_blob_write_latency_ms_sum.fetch_add(static_cast<std::uint64_t>(latency_ms),
+                                                       std::memory_order_relaxed);
+    if (!success) {
+        g_storage_node_blob_write_failures_total.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void RecordStorageNodeRead(bool success, long long latency_ms) {
+    g_storage_node_blob_reads_total.fetch_add(1, std::memory_order_relaxed);
+    g_storage_node_blob_read_latency_ms_sum.fetch_add(static_cast<std::uint64_t>(latency_ms),
+                                                      std::memory_order_relaxed);
+    if (!success) {
+        g_storage_node_blob_read_failures_total.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void RecordStorageNodeDelete(bool success, long long latency_ms) {
+    g_storage_node_blob_deletes_total.fetch_add(1, std::memory_order_relaxed);
+    g_storage_node_blob_delete_latency_ms_sum.fetch_add(static_cast<std::uint64_t>(latency_ms),
+                                                        std::memory_order_relaxed);
+    if (!success) {
+        g_storage_node_blob_delete_failures_total.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 std::string RenderMetrics() {
@@ -90,7 +151,77 @@ std::string RenderMetrics() {
            "# HELP nebulafs_gateway_replica_fallback_total Total distributed read fallback events\n"
            "# TYPE nebulafs_gateway_replica_fallback_total counter\n"
            "nebulafs_gateway_replica_fallback_total " +
-           std::to_string(g_gateway_replica_fallback_total.load(std::memory_order_relaxed)) + "\n";
+           std::to_string(g_gateway_replica_fallback_total.load(std::memory_order_relaxed)) + "\n"
+           "# HELP nebulafs_metadata_allocate_requests_total Total metadata allocate-write requests\n"
+           "# TYPE nebulafs_metadata_allocate_requests_total counter\n"
+           "nebulafs_metadata_allocate_requests_total " +
+           std::to_string(g_metadata_allocate_requests_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_metadata_allocate_failures_total Total metadata allocate-write failures\n"
+           "# TYPE nebulafs_metadata_allocate_failures_total counter\n"
+           "nebulafs_metadata_allocate_failures_total " +
+           std::to_string(g_metadata_allocate_failures_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_metadata_allocate_latency_ms_sum Sum of metadata allocate-write latency in ms\n"
+           "# TYPE nebulafs_metadata_allocate_latency_ms_sum counter\n"
+           "nebulafs_metadata_allocate_latency_ms_sum " +
+           std::to_string(g_metadata_allocate_latency_ms_sum.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_metadata_commit_requests_total Total metadata commit requests\n"
+           "# TYPE nebulafs_metadata_commit_requests_total counter\n"
+           "nebulafs_metadata_commit_requests_total " +
+           std::to_string(g_metadata_commit_requests_total.load(std::memory_order_relaxed)) + "\n"
+           "# HELP nebulafs_metadata_commit_failures_total Total metadata commit failures\n"
+           "# TYPE nebulafs_metadata_commit_failures_total counter\n"
+           "nebulafs_metadata_commit_failures_total " +
+           std::to_string(g_metadata_commit_failures_total.load(std::memory_order_relaxed)) + "\n"
+           "# HELP nebulafs_metadata_commit_latency_ms_sum Sum of metadata commit latency in ms\n"
+           "# TYPE nebulafs_metadata_commit_latency_ms_sum counter\n"
+           "nebulafs_metadata_commit_latency_ms_sum " +
+           std::to_string(g_metadata_commit_latency_ms_sum.load(std::memory_order_relaxed)) + "\n"
+           "# HELP nebulafs_storage_node_blob_writes_total Total storage node blob writes\n"
+           "# TYPE nebulafs_storage_node_blob_writes_total counter\n"
+           "nebulafs_storage_node_blob_writes_total " +
+           std::to_string(g_storage_node_blob_writes_total.load(std::memory_order_relaxed)) + "\n"
+           "# HELP nebulafs_storage_node_blob_write_failures_total Total storage node blob write failures\n"
+           "# TYPE nebulafs_storage_node_blob_write_failures_total counter\n"
+           "nebulafs_storage_node_blob_write_failures_total " +
+           std::to_string(g_storage_node_blob_write_failures_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_write_latency_ms_sum Sum of storage node blob write latency in ms\n"
+           "# TYPE nebulafs_storage_node_blob_write_latency_ms_sum counter\n"
+           "nebulafs_storage_node_blob_write_latency_ms_sum " +
+           std::to_string(g_storage_node_blob_write_latency_ms_sum.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_reads_total Total storage node blob reads\n"
+           "# TYPE nebulafs_storage_node_blob_reads_total counter\n"
+           "nebulafs_storage_node_blob_reads_total " +
+           std::to_string(g_storage_node_blob_reads_total.load(std::memory_order_relaxed)) + "\n"
+           "# HELP nebulafs_storage_node_blob_read_failures_total Total storage node blob read failures\n"
+           "# TYPE nebulafs_storage_node_blob_read_failures_total counter\n"
+           "nebulafs_storage_node_blob_read_failures_total " +
+           std::to_string(g_storage_node_blob_read_failures_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_read_latency_ms_sum Sum of storage node blob read latency in ms\n"
+           "# TYPE nebulafs_storage_node_blob_read_latency_ms_sum counter\n"
+           "nebulafs_storage_node_blob_read_latency_ms_sum " +
+           std::to_string(g_storage_node_blob_read_latency_ms_sum.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_deletes_total Total storage node blob deletes\n"
+           "# TYPE nebulafs_storage_node_blob_deletes_total counter\n"
+           "nebulafs_storage_node_blob_deletes_total " +
+           std::to_string(g_storage_node_blob_deletes_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_delete_failures_total Total storage node blob delete failures\n"
+           "# TYPE nebulafs_storage_node_blob_delete_failures_total counter\n"
+           "nebulafs_storage_node_blob_delete_failures_total " +
+           std::to_string(g_storage_node_blob_delete_failures_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_delete_latency_ms_sum Sum of storage node blob delete latency in ms\n"
+           "# TYPE nebulafs_storage_node_blob_delete_latency_ms_sum counter\n"
+           "nebulafs_storage_node_blob_delete_latency_ms_sum " +
+           std::to_string(g_storage_node_blob_delete_latency_ms_sum.load(std::memory_order_relaxed)) +
+           "\n";
 }
 
 }  // namespace nebulafs::observability

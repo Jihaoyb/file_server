@@ -1,3 +1,4 @@
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -19,6 +20,7 @@
 #include "nebulafs/core/config.h"
 #include "nebulafs/core/logger.h"
 #include "nebulafs/distributed/placement_token.h"
+#include "nebulafs/observability/metrics.h"
 
 namespace {
 
@@ -56,6 +58,12 @@ void WriteJson(Poco::Net::HTTPServerResponse& res, Poco::JSON::Object::Ptr obj,
     obj->stringify(out);
 }
 
+long long ElapsedMs(const std::chrono::steady_clock::time_point& started_at) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - started_at)
+        .count();
+}
+
 class StorageNodeHandler : public Poco::Net::HTTPRequestHandler {
 public:
     StorageNodeHandler(std::string root_path, std::string service_token)
@@ -73,6 +81,12 @@ public:
             root->set("status", "ok");
             return WriteJson(res, root);
         }
+        if (path == "/metrics") {
+            res.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+            res.setContentType("text/plain; version=0.0.4");
+            res.send() << nebulafs::observability::RenderMetrics();
+            return;
+        }
         if (!IsAuthorized(req, service_token_)) {
             res.setStatus(Poco::Net::HTTPResponse::HTTP_UNAUTHORIZED);
             res.send();
@@ -89,7 +103,9 @@ public:
         const auto file_path = BlobPath(root_path_, blob_id);
 
         if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_PUT) {
+            const auto started_at = std::chrono::steady_clock::now();
             if (!HasValidPlacementToken(req, service_token_, blob_id)) {
+                nebulafs::observability::RecordStorageNodeWrite(false, ElapsedMs(started_at));
                 res.setStatus(Poco::Net::HTTPResponse::HTTP_UNAUTHORIZED);
                 res.send();
                 return;
@@ -97,6 +113,7 @@ public:
             std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
             out << req.stream().rdbuf();
             out.close();
+            nebulafs::observability::RecordStorageNodeWrite(true, ElapsedMs(started_at));
             Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
             root->set("blob_id", blob_id);
             root->set("stored", true);
@@ -104,7 +121,9 @@ public:
         }
 
         if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_GET) {
+            const auto started_at = std::chrono::steady_clock::now();
             if (!std::filesystem::exists(file_path)) {
+                nebulafs::observability::RecordStorageNodeRead(false, ElapsedMs(started_at));
                 res.setStatus(Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
                 res.send();
                 return;
@@ -114,12 +133,15 @@ public:
             std::ifstream in(file_path, std::ios::binary);
             std::ostream& out = res.send();
             out << in.rdbuf();
+            nebulafs::observability::RecordStorageNodeRead(true, ElapsedMs(started_at));
             return;
         }
 
         if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_DELETE) {
+            const auto started_at = std::chrono::steady_clock::now();
             std::error_code ec;
             std::filesystem::remove(file_path, ec);
+            nebulafs::observability::RecordStorageNodeDelete(!ec, ElapsedMs(started_at));
             Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
             root->set("blob_id", blob_id);
             root->set("deleted", true);

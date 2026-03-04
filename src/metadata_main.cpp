@@ -1,3 +1,4 @@
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <sstream>
@@ -21,6 +22,7 @@
 #include "nebulafs/core/config.h"
 #include "nebulafs/core/logger.h"
 #include "nebulafs/metadata/sqlite_metadata_store.h"
+#include "nebulafs/observability/metrics.h"
 
 namespace {
 
@@ -54,6 +56,12 @@ Poco::JSON::Object::Ptr ParseBody(Poco::Net::HTTPServerRequest& req) {
     return parser.parse(body.str()).extract<Poco::JSON::Object::Ptr>();
 }
 
+long long ElapsedMs(const std::chrono::steady_clock::time_point& started_at) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - started_at)
+        .count();
+}
+
 class MetadataHandler : public Poco::Net::HTTPRequestHandler {
 public:
     MetadataHandler(std::shared_ptr<nebulafs::metadata::SqliteMetadataStore> store,
@@ -71,6 +79,12 @@ public:
             Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
             root->set("status", "ok");
             return WriteJson(res, root);
+        }
+        if (path == "/metrics") {
+            res.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+            res.setContentType("text/plain; version=0.0.4");
+            res.send() << nebulafs::observability::RenderMetrics();
+            return;
         }
 
         if (path.rfind("/internal/v1/", 0) == 0 && !IsAuthorized(req, token_)) {
@@ -258,16 +272,19 @@ public:
 
         if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_POST &&
             path == "/internal/v1/objects/allocate-write") {
+            const auto started_at = std::chrono::steady_clock::now();
             auto body = ParseBody(req);
             auto result = store_->AllocateWrite(body->getValue<std::string>("bucket"),
                                                 body->getValue<std::string>("object"),
                                                 body->getValue<int>("replication_factor"),
                                                 body->getValue<std::string>("service_token"));
             if (!result.ok()) {
+                nebulafs::observability::RecordMetadataAllocate(false, ElapsedMs(started_at));
                 res.setStatus(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
                 res.send() << result.error().message;
                 return;
             }
+            nebulafs::observability::RecordMetadataAllocate(true, ElapsedMs(started_at));
             Poco::JSON::Array::Ptr replicas = new Poco::JSON::Array();
             for (const auto& replica : result.value().replicas) {
                 Poco::JSON::Object::Ptr item = new Poco::JSON::Object();
@@ -285,6 +302,7 @@ public:
 
         if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_POST &&
             path == "/internal/v1/objects/commit") {
+            const auto started_at = std::chrono::steady_clock::now();
             auto body = ParseBody(req);
             std::vector<nebulafs::metadata::ReplicaTarget> replicas;
             auto arr = body->getArray("replicas");
@@ -300,10 +318,12 @@ public:
                                               body->getValue<Poco::UInt64>("size_bytes"),
                                               body->getValue<std::string>("etag"), replicas);
             if (!result.ok()) {
+                nebulafs::observability::RecordMetadataCommit(false, ElapsedMs(started_at));
                 res.setStatus(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
                 res.send() << result.error().message;
                 return;
             }
+            nebulafs::observability::RecordMetadataCommit(true, ElapsedMs(started_at));
             Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
             root->set("ok", true);
             return WriteJson(res, root);

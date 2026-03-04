@@ -859,6 +859,46 @@ TEST(IntegrationHttp, DistributedCrudSmoke) {
         auto del = SendRequest(http::verb::delete_, "127.0.0.1", gateway_port,
                                "/v1/buckets/demo/objects/readme.txt", "", "");
         ASSERT_EQ(del.result(), http::status::ok);
+
+        auto metadata_metrics =
+            SendRequest(http::verb::get, "127.0.0.1", metadata_port, "/metrics", "", "");
+        ASSERT_EQ(metadata_metrics.result(), http::status::ok);
+        auto metadata_allocate =
+            ParseMetricCounter(metadata_metrics.body(), "nebulafs_metadata_allocate_requests_total");
+        auto metadata_commit =
+            ParseMetricCounter(metadata_metrics.body(), "nebulafs_metadata_commit_requests_total");
+        ASSERT_TRUE(metadata_allocate.has_value());
+        ASSERT_TRUE(metadata_commit.has_value());
+        EXPECT_GE(*metadata_allocate, 1);
+        EXPECT_GE(*metadata_commit, 1);
+
+        auto storage1_metrics =
+            SendRequest(http::verb::get, "127.0.0.1", storage1_port, "/metrics", "", "");
+        auto storage2_metrics =
+            SendRequest(http::verb::get, "127.0.0.1", storage2_port, "/metrics", "", "");
+        ASSERT_EQ(storage1_metrics.result(), http::status::ok);
+        ASSERT_EQ(storage2_metrics.result(), http::status::ok);
+
+        auto storage1_writes = ParseMetricCounter(storage1_metrics.body(),
+                                                  "nebulafs_storage_node_blob_writes_total");
+        auto storage2_writes = ParseMetricCounter(storage2_metrics.body(),
+                                                  "nebulafs_storage_node_blob_writes_total");
+        auto storage1_deletes = ParseMetricCounter(storage1_metrics.body(),
+                                                   "nebulafs_storage_node_blob_deletes_total");
+        auto storage2_deletes = ParseMetricCounter(storage2_metrics.body(),
+                                                   "nebulafs_storage_node_blob_deletes_total");
+        auto storage1_reads = ParseMetricCounter(storage1_metrics.body(),
+                                                 "nebulafs_storage_node_blob_reads_total");
+        ASSERT_TRUE(storage1_writes.has_value());
+        ASSERT_TRUE(storage2_writes.has_value());
+        ASSERT_TRUE(storage1_deletes.has_value());
+        ASSERT_TRUE(storage2_deletes.has_value());
+        ASSERT_TRUE(storage1_reads.has_value());
+        EXPECT_GE(*storage1_writes, 1);
+        EXPECT_GE(*storage2_writes, 1);
+        EXPECT_GE(*storage1_deletes, 1);
+        EXPECT_GE(*storage2_deletes, 1);
+        EXPECT_GE(*storage1_reads, 1);
     }
 
     CleanupTempDir(temp_dir);
