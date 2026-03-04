@@ -12,5 +12,11 @@ void RecordRequest(int status_code, long long latency_ms);
 void RecordRateLimited();
 /// @brief Record a request that exceeded timeout budget.
 void RecordTimedOut();
+/// @brief Record distributed storage PUT failures from gateway.
+void RecordGatewayStoragePutFailure();
+/// @brief Record distributed metadata RPC failures from gateway.
+void RecordGatewayMetadataRpcFailure();
+/// @brief Record replica fallback on distributed reads.
+void RecordGatewayReplicaFallback();
 
 }  // namespace nebulafs::observability

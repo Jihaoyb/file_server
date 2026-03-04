@@ -12,6 +12,8 @@ find_package(OpenSSL REQUIRED)
 find_package(Poco REQUIRED COMPONENTS Foundation Util JSON Crypto Data DataSQLite Net NetSSL)
 
 add_library(nebulafs_core
+    src/distributed/http_client.cpp
+    src/distributed/placement_token.cpp
     src/auth/jwks_cache.cpp
     src/auth/jwt_utils.cpp
     src/auth/jwt_verifier.cpp
@@ -21,7 +23,9 @@ add_library(nebulafs_core
     src/core/ids.cpp
     src/core/time.cpp
     src/metadata/sqlite_metadata_store.cpp
+    src/metadata/remote_metadata_store.cpp
     src/storage/local_storage.cpp
+    src/storage/remote_storage_backend.cpp
     src/observability/metrics.cpp
     src/http/router.cpp
     src/http/route_registration.cpp
@@ -67,6 +71,16 @@ add_executable(nebulafs
 
 target_link_libraries(nebulafs PRIVATE nebulafs_core)
 
+add_executable(nebulafs_metadata
+    src/metadata_main.cpp
+)
+target_link_libraries(nebulafs_metadata PRIVATE nebulafs_core)
+
+add_executable(nebulafs_storage_node
+    src/storage_node_main.cpp
+)
+target_link_libraries(nebulafs_storage_node PRIVATE nebulafs_core)
+
 if(NEBULAFS_ENABLE_TESTS)
     enable_testing()
     find_package(GTest REQUIRED)
@@ -88,6 +102,8 @@ if(NEBULAFS_ENABLE_TESTS)
         nebulafs_integration_tests
         PRIVATE
             NEBULAFS_SERVER_PATH="$<TARGET_FILE:nebulafs>"
+            NEBULAFS_METADATA_PATH="$<TARGET_FILE:nebulafs_metadata>"
+            NEBULAFS_STORAGE_NODE_PATH="$<TARGET_FILE:nebulafs_storage_node>"
     )
     add_test(NAME nebulafs_integration_tests COMMAND nebulafs_integration_tests)
 endif()

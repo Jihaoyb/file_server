@@ -30,6 +30,7 @@ Config LoadConfig(const std::string& path) {
     config.server.host = cfg->getString("server.host", "0.0.0.0");
     config.server.port = cfg->getInt("server.port", 8080);
     config.server.threads = cfg->getInt("server.threads", 4);
+    config.server.mode = cfg->getString("server.mode", "single_node");
     config.server.tls.enabled = cfg->getBool("server.tls.enabled", false);
     config.server.tls.certificate = cfg->getString("server.tls.certificate", "");
     config.server.tls.private_key = cfg->getString("server.tls.private_key", "");
@@ -59,6 +60,24 @@ Config LoadConfig(const std::string& path) {
     config.auth.clock_skew_seconds = cfg->getInt("auth.clock_skew_seconds", 60);
     config.auth.allowed_alg = cfg->getString("auth.allowed_alg", "RS256");
 
+    config.distributed.metadata_base_url = cfg->getString("distributed.metadata_base_url", "");
+    config.distributed.service_auth_token = cfg->getString("distributed.service_auth_token", "");
+    config.distributed.replication_factor = cfg->getInt("distributed.replication_factor", 2);
+    config.distributed.min_write_acks = cfg->getInt("distributed.min_write_acks", 2);
+    for (int i = 0;; ++i) {
+        const auto key = "distributed.storage_nodes[" + std::to_string(i) + "]";
+        if (!cfg->hasProperty(key)) {
+            break;
+        }
+        const auto endpoint = cfg->getString(key, "");
+        if (!IsBlank(endpoint)) {
+            config.distributed.storage_nodes.push_back(endpoint);
+        }
+    }
+
+    if (config.server.mode != "single_node" && config.server.mode != "distributed") {
+        throw std::invalid_argument("server.mode must be 'single_node' or 'distributed'");
+    }
     if (config.auth.enabled) {
         // Fail fast so auth mode cannot run with incomplete trust configuration.
         if (IsBlank(config.auth.issuer)) {
@@ -85,6 +104,35 @@ Config LoadConfig(const std::string& path) {
     }
     if (config.server.limits.rate_limit_burst < 0) {
         throw std::invalid_argument("server.limits.rate_limit_burst must be >= 0");
+    }
+    if (config.server.mode == "distributed") {
+        if (IsBlank(config.distributed.metadata_base_url)) {
+            throw std::invalid_argument(
+                "server.mode=distributed requires non-empty distributed.metadata_base_url");
+        }
+        if (IsBlank(config.distributed.service_auth_token)) {
+            throw std::invalid_argument(
+                "server.mode=distributed requires non-empty distributed.service_auth_token");
+        }
+        if (config.distributed.storage_nodes.empty()) {
+            throw std::invalid_argument(
+                "server.mode=distributed requires distributed.storage_nodes");
+        }
+        if (config.distributed.replication_factor <= 0) {
+            throw std::invalid_argument("distributed.replication_factor must be positive");
+        }
+        if (config.distributed.min_write_acks <= 0) {
+            throw std::invalid_argument("distributed.min_write_acks must be positive");
+        }
+        if (config.distributed.min_write_acks > config.distributed.replication_factor) {
+            throw std::invalid_argument(
+                "distributed.min_write_acks must be <= distributed.replication_factor");
+        }
+        if (static_cast<int>(config.distributed.storage_nodes.size()) <
+            config.distributed.replication_factor) {
+            throw std::invalid_argument(
+                "distributed.storage_nodes must have at least replication_factor endpoints");
+        }
     }
     return config;
 }

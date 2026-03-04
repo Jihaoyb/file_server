@@ -7,6 +7,12 @@
 #include "nebulafs/core/error.h"
 #include "nebulafs/core/result.h"
 
+// Windows headers define GetObject as a macro (GetObjectW/A). Undefine it here to
+// keep metadata interface method names stable across platforms.
+#ifdef GetObject
+#undef GetObject
+#endif
+
 namespace nebulafs::metadata {
 
 /// @brief Bucket metadata record.
@@ -50,6 +56,35 @@ struct MultipartPart {
     std::string created_at;
 };
 
+/// @brief Registered storage node endpoint for distributed mode placement.
+struct StorageNodeRecord {
+    int id{0};
+    std::string endpoint;
+    std::string status;
+};
+
+/// @brief One replica target returned by write allocation.
+struct ReplicaTarget {
+    int node_id{0};
+    int replica_index{0};
+    std::string endpoint;
+};
+
+/// @brief Allocation plan for writing a distributed object.
+struct AllocateWritePlan {
+    std::string blob_id;
+    std::string write_token;
+    std::vector<ReplicaTarget> replicas;
+};
+
+/// @brief Resolved read plan for a distributed object.
+struct ResolveReadPlan {
+    std::string blob_id;
+    std::string etag;
+    std::uint64_t size_bytes{0};
+    std::vector<ReplicaTarget> replicas;
+};
+
 /// @brief Abstract metadata store interface for buckets and objects.
 class MetadataStore {
 public:
@@ -87,6 +122,22 @@ public:
     virtual core::Result<std::vector<MultipartPart>> ListMultipartParts(
         const std::string& upload_id) = 0;
     virtual core::Result<void> DeleteMultipartParts(const std::string& upload_id) = 0;
+
+    // Distributed placement and read-resolution APIs.
+    virtual core::Result<void> ConfigureStorageNodes(
+        const std::vector<std::string>& endpoints) = 0;
+    virtual core::Result<AllocateWritePlan> AllocateWrite(const std::string& bucket,
+                                                          const std::string& object_name,
+                                                          int replication_factor,
+                                                          const std::string& service_token) = 0;
+    virtual core::Result<void> CommitWrite(const std::string& bucket,
+                                           const std::string& object_name,
+                                           const std::string& blob_id,
+                                           std::uint64_t size_bytes,
+                                           const std::string& etag,
+                                           const std::vector<ReplicaTarget>& replicas) = 0;
+    virtual core::Result<ResolveReadPlan> ResolveRead(const std::string& bucket,
+                                                      const std::string& object_name) = 0;
 };
 
 }  // namespace nebulafs::metadata

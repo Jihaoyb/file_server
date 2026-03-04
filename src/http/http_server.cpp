@@ -32,6 +32,7 @@
 #include "nebulafs/observability/metrics.h"
 #include "nebulafs/auth/jwt_utils.h"
 #include "nebulafs/auth/jwt_verifier.h"
+#include "nebulafs/storage/local_storage.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -179,8 +180,8 @@ template <typename Stream>
 class Session : public std::enable_shared_from_this<Session<Stream>> {
 public:
     Session(Stream&& stream, nebulafs::http::Router router, nebulafs::core::Config config,
-            std::shared_ptr<nebulafs::storage::LocalStorage> storage,
-            std::shared_ptr<nebulafs::metadata::MetadataStore> metadata,
+            std::shared_ptr<nebulafs::storage::StorageBackend> storage,
+            std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata,
             std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier,
             std::shared_ptr<RateLimiter> rate_limiter)
         : stream_(std::move(stream)),
@@ -446,7 +447,13 @@ private:
             return Send(std::move(response));
         }
 
-        storage_->EnsureBucket(bucket);
+        auto ensure_bucket = storage_->EnsureBucket(bucket);
+        if (!ensure_bucket.ok()) {
+            auto response = ErrorResponse(http::status::internal_server_error,
+                                          parser_->get().version(), "STORAGE_ERROR",
+                                          ensure_bucket.error().message, request_id_);
+            return Send(std::move(response));
+        }
 
         upload_bucket_ = bucket;
         upload_object_ = object;
@@ -527,23 +534,36 @@ private:
         ::fsync(upload_fd_);
         ::close(upload_fd_);
 #endif
-        // Atomic rename ensures readers never see partial files.
-        const auto final_path = nebulafs::storage::LocalStorage::BuildObjectPath(
-            storage_->base_path(), upload_bucket_, upload_object_);
-        std::filesystem::create_directories(std::filesystem::path(final_path).parent_path());
-        std::filesystem::rename(upload_temp_path_, final_path);
+        std::ifstream input(upload_temp_path_, std::ios::binary);
+        if (!input.is_open()) {
+            auto response = ErrorResponse(http::status::internal_server_error,
+                                          parser_->get().version(), "IO_ERROR",
+                                          "failed to reopen upload temp file", request_id_);
+            return Send(std::move(response));
+        }
+        auto stored = storage_->WriteObject(upload_bucket_, upload_object_, input);
+        input.close();
+        std::filesystem::remove(upload_temp_path_);
+        if (!stored.ok()) {
+            auto response =
+                ErrorResponse(http::status::internal_server_error, parser_->get().version(),
+                              "STORAGE_ERROR", stored.error().message, request_id_);
+            return Send(std::move(response));
+        }
 
         nebulafs::metadata::ObjectMetadata meta;
         meta.name = upload_object_;
-        meta.size_bytes = upload_total_;
-        meta.etag = Poco::DigestEngine::digestToHex(upload_hasher_->digest());
+        meta.size_bytes = stored.value().size_bytes;
+        meta.etag = stored.value().etag;
 
-        auto result = metadata_->UpsertObject(upload_bucket_, meta);
-        if (!result.ok()) {
-            auto response = ErrorResponse(http::status::internal_server_error,
-                                          parser_->get().version(), "METADATA_ERROR",
-                                          result.error().message, request_id_);
-            return Send(std::move(response));
+        if (config_.server.mode != "distributed") {
+            auto result = metadata_->UpsertObject(upload_bucket_, meta);
+            if (!result.ok()) {
+                auto response = ErrorResponse(http::status::internal_server_error,
+                                              parser_->get().version(), "METADATA_ERROR",
+                                              result.error().message, request_id_);
+                return Send(std::move(response));
+            }
         }
 
         auto response = JsonResponse(http::status::ok, parser_->get().version(),
@@ -698,8 +718,8 @@ private:
 
     nebulafs::http::Router router_;
     nebulafs::core::Config config_;
-    std::shared_ptr<nebulafs::storage::LocalStorage> storage_;
-    std::shared_ptr<nebulafs::metadata::MetadataStore> metadata_;
+    std::shared_ptr<nebulafs::storage::StorageBackend> storage_;
+    std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata_;
     std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier_;
     std::shared_ptr<RateLimiter> rate_limiter_;
 
@@ -728,8 +748,8 @@ class Listener : public std::enable_shared_from_this<Listener> {
 public:
     Listener(net::io_context& ioc, tcp::endpoint endpoint, nebulafs::http::Router router,
              nebulafs::core::Config config,
-             std::shared_ptr<nebulafs::storage::LocalStorage> storage,
-             std::shared_ptr<nebulafs::metadata::MetadataStore> metadata,
+             std::shared_ptr<nebulafs::storage::StorageBackend> storage,
+             std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata,
              std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier,
              std::shared_ptr<RateLimiter> rate_limiter,
              net::ssl::context* ssl_ctx)
@@ -780,8 +800,8 @@ private:
     tcp::acceptor acceptor_;
     nebulafs::http::Router router_;
     nebulafs::core::Config config_;
-    std::shared_ptr<nebulafs::storage::LocalStorage> storage_;
-    std::shared_ptr<nebulafs::metadata::MetadataStore> metadata_;
+    std::shared_ptr<nebulafs::storage::StorageBackend> storage_;
+    std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata_;
     std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier_;
     std::shared_ptr<RateLimiter> rate_limiter_;
     net::ssl::context* ssl_ctx_{nullptr};
@@ -792,8 +812,8 @@ private:
 namespace nebulafs::http {
 
 HttpServer::HttpServer(boost::asio::io_context& ioc, const core::Config& config, Router router,
-                       std::shared_ptr<storage::LocalStorage> storage,
-                       std::shared_ptr<metadata::MetadataStore> metadata)
+                       std::shared_ptr<storage::StorageBackend> storage,
+                       std::shared_ptr<metadata::MetadataBackend> metadata)
     : ioc_(ioc),
       config_(config),
       router_(std::move(router)),
@@ -822,7 +842,7 @@ void HttpServer::Run() {
 }
 
 void HttpServer::StartCleanupJob() {
-    if (!config_.cleanup.enabled) {
+    if (!config_.cleanup.enabled || config_.server.mode == "distributed") {
         return;
     }
     cleanup_timer_ = std::make_unique<net::steady_timer>(ioc_);

@@ -11,8 +11,12 @@
 #include "nebulafs/http/http_server.h"
 #include "nebulafs/http/route_registration.h"
 #include "nebulafs/http/router.h"
+#include "nebulafs/metadata/metadata_backend.h"
+#include "nebulafs/metadata/remote_metadata_store.h"
 #include "nebulafs/metadata/sqlite_metadata_store.h"
 #include "nebulafs/storage/local_storage.h"
+#include "nebulafs/storage/remote_storage_backend.h"
+#include "nebulafs/storage/storage_backend.h"
 
 namespace {
 
@@ -35,11 +39,26 @@ int main(int argc, char** argv) {
     auto config = nebulafs::core::LoadConfig(config_path);
     nebulafs::core::InitLogging(config.observability.log_level);
 
-    auto sqlite_path = nebulafs::core::LoadDatabasePath(db_path);
-    std::filesystem::create_directories(std::filesystem::path(sqlite_path).parent_path());
-    auto metadata = std::make_shared<nebulafs::metadata::SqliteMetadataStore>(sqlite_path);
-    auto storage = std::make_shared<nebulafs::storage::LocalStorage>(config.storage.base_path,
-                                                                     config.storage.temp_path);
+    std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata;
+    std::shared_ptr<nebulafs::storage::StorageBackend> storage;
+    if (config.server.mode == "distributed") {
+        metadata = std::make_shared<nebulafs::metadata::RemoteMetadataStore>(
+            config.distributed.metadata_base_url, config.distributed.service_auth_token);
+        auto configured_nodes = metadata->ConfigureStorageNodes(config.distributed.storage_nodes);
+        if (!configured_nodes.ok()) {
+            nebulafs::core::LogError("Failed to configure storage nodes: " +
+                                     configured_nodes.error().message);
+            return 1;
+        }
+        storage = std::make_shared<nebulafs::storage::RemoteStorageBackend>(
+            config.distributed, metadata, config.storage.temp_path);
+    } else {
+        auto sqlite_path = nebulafs::core::LoadDatabasePath(db_path);
+        std::filesystem::create_directories(std::filesystem::path(sqlite_path).parent_path());
+        metadata = std::make_shared<nebulafs::metadata::SqliteMetadataStore>(sqlite_path);
+        storage = std::make_shared<nebulafs::storage::LocalStorage>(config.storage.base_path,
+                                                                    config.storage.temp_path);
+    }
 
     nebulafs::http::Router router;
     nebulafs::http::RegisterDefaultRoutes(router, metadata, storage, config);

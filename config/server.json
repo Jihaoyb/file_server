@@ -3,6 +3,7 @@
     "host": "0.0.0.0",
     "port": 8080,
     "threads": 4,
+    "mode": "single_node",
     "tls": {
       "enabled": false,
       "certificate": "config/ssl/server.crt",
@@ -39,5 +40,15 @@
     "cache_ttl_seconds": 300,
     "clock_skew_seconds": 60,
     "allowed_alg": "RS256"
+  },
+  "distributed": {
+    "metadata_base_url": "http://127.0.0.1:9091",
+    "storage_nodes": [
+      "http://127.0.0.1:9092",
+      "http://127.0.0.1:9093"
+    ],
+    "service_auth_token": "change-me-for-production",
+    "replication_factor": 2,
+    "min_write_acks": 2
   }
 }

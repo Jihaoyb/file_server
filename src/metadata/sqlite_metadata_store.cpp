@@ -3,8 +3,11 @@
 #include <Poco/Data/SessionFactory.h>
 #include <Poco/Data/SQLite/Connector.h>
 #include <Poco/Data/Statement.h>
+#include <Poco/UUIDGenerator.h>
 
 #include "nebulafs/core/time.h"
+#include "nebulafs/distributed/placement_token.h"
+#include "nebulafs/storage/local_storage.h"
 
 namespace {
 using namespace Poco::Data::Keywords;
@@ -81,6 +84,37 @@ void SqliteMetadataStore::InitSchema() {
     session_ <<
             "CREATE INDEX IF NOT EXISTS idx_multipart_parts_upload_id "
             "ON multipart_parts(upload_id)",
+        now;
+
+    session_ <<
+            "CREATE TABLE IF NOT EXISTS storage_nodes ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "endpoint TEXT NOT NULL UNIQUE,"
+            "status TEXT NOT NULL,"
+            "capacity_bytes INTEGER NOT NULL DEFAULT 0,"
+            "free_bytes INTEGER NOT NULL DEFAULT 0,"
+            "updated_at TEXT NOT NULL"
+            ")",
+        now;
+
+    session_ <<
+            "CREATE TABLE IF NOT EXISTS object_replicas ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "object_id INTEGER NOT NULL,"
+            "node_id INTEGER NOT NULL,"
+            "blob_id TEXT NOT NULL,"
+            "replica_index INTEGER NOT NULL,"
+            "state TEXT NOT NULL,"
+            "checksum TEXT NOT NULL,"
+            "updated_at TEXT NOT NULL,"
+            "UNIQUE(object_id, replica_index),"
+            "FOREIGN KEY(object_id) REFERENCES objects(id) ON DELETE CASCADE,"
+            "FOREIGN KEY(node_id) REFERENCES storage_nodes(id) ON DELETE CASCADE"
+            ")",
+        now;
+    session_ <<
+            "CREATE INDEX IF NOT EXISTS idx_object_replicas_object_id "
+            "ON object_replicas(object_id)",
         now;
 }
 
@@ -395,6 +429,144 @@ core::Result<void> SqliteMetadataStore::DeleteMultipartParts(const std::string& 
     Poco::Data::Statement del(session_);
     del << "DELETE FROM multipart_parts WHERE upload_id = ?", use(upload_id_value), now;
     return core::Ok();
+}
+
+core::Result<void> SqliteMetadataStore::ConfigureStorageNodes(
+    const std::vector<std::string>& endpoints) {
+    try {
+        session_ << "DELETE FROM storage_nodes", now;
+        const auto now_time = core::NowIso8601();
+        for (const auto& endpoint : endpoints) {
+            std::string endpoint_value = endpoint;
+            std::string status_value = "active";
+            std::string updated_at_value = now_time;
+            session_ <<
+                    "INSERT INTO storage_nodes(endpoint, status, updated_at) VALUES(?, ?, ?)",
+                use(endpoint_value), use(status_value), use(updated_at_value), now;
+        }
+        return core::Ok();
+    } catch (const Poco::Exception& ex) {
+        return core::Error{core::ErrorCode::kDbError, ex.displayText()};
+    }
+}
+
+core::Result<AllocateWritePlan> SqliteMetadataStore::AllocateWrite(
+    const std::string& bucket, const std::string& object_name, int replication_factor,
+    const std::string& service_token) {
+    auto bucket_result = GetBucket(bucket);
+    if (!bucket_result.ok()) {
+        return bucket_result.error();
+    }
+    if (!storage::LocalStorage::IsSafeName(object_name)) {
+        return core::Error{core::ErrorCode::kInvalidArgument, "invalid object name"};
+    }
+
+    AllocateWritePlan plan;
+    plan.blob_id = Poco::UUIDGenerator().createOne().toString();
+    plan.write_token =
+        nebulafs::distributed::CreatePlacementToken(plan.blob_id, "write", 120, service_token);
+
+    int id = 0;
+    std::string endpoint;
+    Poco::Data::Statement select(session_);
+    select << "SELECT id, endpoint FROM storage_nodes WHERE status = 'active' ORDER BY id ASC",
+        into(id), into(endpoint), range(0, 1);
+
+    int index = 0;
+    while (!select.done() && index < replication_factor) {
+        id = 0;
+        endpoint.clear();
+        select.execute();
+        if (!endpoint.empty()) {
+            plan.replicas.push_back(ReplicaTarget{id, index, endpoint});
+            ++index;
+        }
+    }
+    if (static_cast<int>(plan.replicas.size()) < replication_factor) {
+        return core::Error{core::ErrorCode::kInternal, "insufficient active storage nodes"};
+    }
+    return plan;
+}
+
+core::Result<void> SqliteMetadataStore::CommitWrite(const std::string& bucket,
+                                                    const std::string& object_name,
+                                                    const std::string& blob_id,
+                                                    std::uint64_t size_bytes,
+                                                    const std::string& etag,
+                                                    const std::vector<ReplicaTarget>& replicas) {
+    nebulafs::metadata::ObjectMetadata object;
+    object.name = object_name;
+    object.size_bytes = size_bytes;
+    object.etag = etag;
+    auto upsert = UpsertObject(bucket, object);
+    if (!upsert.ok()) {
+        return upsert.error();
+    }
+
+    std::string now_time = core::NowIso8601();
+    int object_id = upsert.value().id;
+    try {
+        session_ << "DELETE FROM object_replicas WHERE object_id = ?", use(object_id), now;
+        for (const auto& replica : replicas) {
+            int node_id_value = replica.node_id;
+            int replica_index_value = replica.replica_index;
+            std::string blob_id_value = blob_id;
+            std::string state_value = "committed";
+            std::string checksum_value = etag;
+            std::string updated_at_value = now_time;
+            session_ <<
+                    "INSERT INTO object_replicas(object_id, node_id, blob_id, replica_index, "
+                    "state, checksum, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                use(object_id), use(node_id_value), use(blob_id_value), use(replica_index_value),
+                use(state_value), use(checksum_value), use(updated_at_value), now;
+        }
+        return core::Ok();
+    } catch (const Poco::Exception& ex) {
+        return core::Error{core::ErrorCode::kDbError, ex.displayText()};
+    }
+}
+
+core::Result<ResolveReadPlan> SqliteMetadataStore::ResolveRead(const std::string& bucket,
+                                                               const std::string& object_name) {
+    auto object = GetObject(bucket, object_name);
+    if (!object.ok()) {
+        return object.error();
+    }
+
+    ResolveReadPlan plan;
+    plan.size_bytes = object.value().size_bytes;
+    plan.etag = object.value().etag;
+
+    int node_id = 0;
+    int replica_index = 0;
+    std::string endpoint;
+    std::string blob_id;
+    Poco::Data::Statement select(session_);
+    select <<
+            "SELECT r.node_id, r.replica_index, s.endpoint, r.blob_id "
+            "FROM object_replicas r JOIN storage_nodes s ON r.node_id = s.id "
+            "WHERE r.object_id = ? AND r.state = 'committed' "
+            "ORDER BY r.replica_index ASC",
+        use(object.value().id), into(node_id), into(replica_index), into(endpoint), into(blob_id),
+        range(0, 1);
+
+    while (!select.done()) {
+        node_id = 0;
+        replica_index = 0;
+        endpoint.clear();
+        blob_id.clear();
+        select.execute();
+        if (!endpoint.empty() && !blob_id.empty()) {
+            if (plan.blob_id.empty()) {
+                plan.blob_id = blob_id;
+            }
+            plan.replicas.push_back(ReplicaTarget{node_id, replica_index, endpoint});
+        }
+    }
+    if (plan.replicas.empty()) {
+        return core::Error{core::ErrorCode::kNotFound, "object has no committed replicas"};
+    }
+    return plan;
 }
 
 }  // namespace nebulafs::metadata
