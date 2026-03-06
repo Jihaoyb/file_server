@@ -979,6 +979,86 @@ TEST(IntegrationHttp, DistributedCrudSmoke) {
     CleanupTempDir(temp_dir);
 }
 
+TEST(IntegrationHttp, DistributedLargeObjectStreamingWrite) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto gateway_port = FindFreePort();
+    const auto metadata_port = FindFreePort();
+    const auto storage1_port = FindFreePort();
+    const auto storage2_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage1_port),
+        "http://127.0.0.1:" + std::to_string(storage2_port),
+    };
+    const auto metadata_url = "http://127.0.0.1:" + std::to_string(metadata_port);
+
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage1_config = WriteStorageNodeConfig(temp_dir / "storage1", storage1_port, token);
+    const auto storage2_config = WriteStorageNodeConfig(temp_dir / "storage2", storage2_port, token);
+    const auto gateway_config = WriteGatewayDistributedConfig(temp_dir / "gateway", gateway_port,
+                                                              metadata_url, storage_nodes, token);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage1_args = {"--config", storage1_config.string()};
+    std::vector<std::string> storage2_args = {"--config", storage2_config.string()};
+    std::vector<std::string> gateway_args = {"--config", gateway_config.string(), "--database",
+                                             metadata_db.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage1_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage1_args);
+    auto storage2_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage2_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage1(std::move(storage1_handle));
+        ServerProcess storage2(std::move(storage2_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage1_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage2_port));
+
+        auto gateway_handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, gateway_args);
+        ServerProcess gateway(std::move(gateway_handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", gateway_port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", gateway_port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        const std::string payload(6 * 1024 * 1024, 'x');
+        auto upload = SendRequest(http::verb::put, "127.0.0.1", gateway_port,
+                                  "/v1/buckets/demo/objects/large.bin", payload, "");
+        ASSERT_EQ(upload.result(), http::status::ok);
+
+        auto download = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/objects/large.bin", "", "");
+        ASSERT_EQ(download.result(), http::status::ok);
+        ASSERT_EQ(download.body().size(), payload.size());
+        EXPECT_EQ(download.body().substr(0, 1024), payload.substr(0, 1024));
+
+        const auto spool_dir = temp_dir / "gateway" / "storage" / "tmp" / "remote_spool";
+        bool spool_cleaned = false;
+        for (int i = 0; i < 10; ++i) {
+            if (CountRegularFiles(spool_dir) == 0) {
+                spool_cleaned = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        EXPECT_TRUE(spool_cleaned);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
 TEST(IntegrationHttp, DistributedReadFallbackWhenPrimaryDown) {
     const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
     if (!enabled || std::string(enabled) != "1") {
