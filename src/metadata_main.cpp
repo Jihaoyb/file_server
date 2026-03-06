@@ -285,6 +285,195 @@ public:
             }
 
             if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_POST &&
+                path == "/internal/v1/multipart/uploads/create") {
+                auto body = ParseBody(req);
+                auto result = store_->CreateMultipartUpload(
+                    body->getValue<std::string>("bucket"), body->getValue<std::string>("upload_id"),
+                    body->getValue<std::string>("object"), body->getValue<std::string>("expires_at"));
+                if (!result.ok()) {
+                    if (result.error().code == nebulafs::core::ErrorCode::kNotFound) {
+                        return WriteError(res, request_id, "NOT_FOUND", "bucket not found",
+                                          Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                    }
+                    if (result.error().code == nebulafs::core::ErrorCode::kAlreadyExists) {
+                        return WriteError(res, request_id, "ALREADY_EXISTS",
+                                          "multipart upload already exists",
+                                          Poco::Net::HTTPResponse::HTTP_CONFLICT);
+                    }
+                    return WriteError(res, request_id, "INTERNAL_ERROR", result.error().message,
+                                      Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+                }
+                Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                root->set("id", result.value().id);
+                root->set("upload_id", result.value().upload_id);
+                root->set("bucket_id", result.value().bucket_id);
+                root->set("object_name", result.value().object_name);
+                root->set("state", result.value().state);
+                root->set("expires_at", result.value().expires_at);
+                root->set("created_at", result.value().created_at);
+                root->set("updated_at", result.value().updated_at);
+                return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+            }
+
+            if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_GET &&
+                path == "/internal/v1/multipart/uploads/get") {
+                std::string upload_id;
+                for (const auto& p : uri.getQueryParameters()) {
+                    if (p.first == "upload_id") upload_id = p.second;
+                }
+                auto result = store_->GetMultipartUpload(upload_id);
+                if (!result.ok()) {
+                    return WriteError(res, request_id, "NOT_FOUND", "multipart upload not found",
+                                      Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                }
+                Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                root->set("id", result.value().id);
+                root->set("upload_id", result.value().upload_id);
+                root->set("bucket_id", result.value().bucket_id);
+                root->set("object_name", result.value().object_name);
+                root->set("state", result.value().state);
+                root->set("expires_at", result.value().expires_at);
+                root->set("created_at", result.value().created_at);
+                root->set("updated_at", result.value().updated_at);
+                return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+            }
+
+            if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_GET &&
+                path == "/internal/v1/multipart/uploads/list-expired") {
+                std::string expires_before;
+                int limit = 100;
+                for (const auto& p : uri.getQueryParameters()) {
+                    if (p.first == "expires_before") expires_before = p.second;
+                    if (p.first == "limit") limit = std::stoi(p.second);
+                }
+                auto result = store_->ListExpiredMultipartUploads(expires_before, limit);
+                if (!result.ok()) {
+                    return WriteError(res, request_id, "INTERNAL_ERROR", result.error().message,
+                                      Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+                }
+                Poco::JSON::Array::Ptr uploads = new Poco::JSON::Array();
+                for (const auto& upload : result.value()) {
+                    Poco::JSON::Object::Ptr item = new Poco::JSON::Object();
+                    item->set("id", upload.id);
+                    item->set("upload_id", upload.upload_id);
+                    item->set("bucket_id", upload.bucket_id);
+                    item->set("object_name", upload.object_name);
+                    item->set("state", upload.state);
+                    item->set("expires_at", upload.expires_at);
+                    item->set("created_at", upload.created_at);
+                    item->set("updated_at", upload.updated_at);
+                    uploads->add(item);
+                }
+                Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                root->set("uploads", uploads);
+                return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+            }
+
+            if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_POST &&
+                path == "/internal/v1/multipart/uploads/state") {
+                auto body = ParseBody(req);
+                auto result = store_->UpdateMultipartUploadState(
+                    body->getValue<std::string>("upload_id"), body->getValue<std::string>("state"));
+                if (!result.ok()) {
+                    if (result.error().code == nebulafs::core::ErrorCode::kNotFound) {
+                        return WriteError(res, request_id, "NOT_FOUND", "multipart upload not found",
+                                          Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                    }
+                    return WriteError(res, request_id, "INTERNAL_ERROR", result.error().message,
+                                      Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+                }
+                Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                root->set("ok", true);
+                return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+            }
+
+            if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_DELETE &&
+                path == "/internal/v1/multipart/uploads/delete") {
+                std::string upload_id;
+                for (const auto& p : uri.getQueryParameters()) {
+                    if (p.first == "upload_id") upload_id = p.second;
+                }
+                auto result = store_->DeleteMultipartUpload(upload_id);
+                if (!result.ok()) {
+                    return WriteError(res, request_id, "INTERNAL_ERROR", result.error().message,
+                                      Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+                }
+                Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                root->set("ok", true);
+                return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+            }
+
+            if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_POST &&
+                path == "/internal/v1/multipart/parts/upsert") {
+                auto body = ParseBody(req);
+                auto result = store_->UpsertMultipartPart(
+                    body->getValue<std::string>("upload_id"), body->getValue<int>("part_number"),
+                    body->getValue<Poco::UInt64>("size_bytes"), body->getValue<std::string>("etag"),
+                    body->getValue<std::string>("temp_path"));
+                if (!result.ok()) {
+                    if (result.error().code == nebulafs::core::ErrorCode::kNotFound) {
+                        return WriteError(res, request_id, "NOT_FOUND", "multipart upload not found",
+                                          Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                    }
+                    return WriteError(res, request_id, "INTERNAL_ERROR", result.error().message,
+                                      Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+                }
+                Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                root->set("id", result.value().id);
+                root->set("upload_id", result.value().upload_id);
+                root->set("part_number", result.value().part_number);
+                root->set("size_bytes", static_cast<Poco::UInt64>(result.value().size_bytes));
+                root->set("etag", result.value().etag);
+                root->set("temp_path", result.value().temp_path);
+                root->set("created_at", result.value().created_at);
+                return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+            }
+
+            if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_GET &&
+                path == "/internal/v1/multipart/parts/list") {
+                std::string upload_id;
+                for (const auto& p : uri.getQueryParameters()) {
+                    if (p.first == "upload_id") upload_id = p.second;
+                }
+                auto result = store_->ListMultipartParts(upload_id);
+                if (!result.ok()) {
+                    return WriteError(res, request_id, "INTERNAL_ERROR", result.error().message,
+                                      Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+                }
+                Poco::JSON::Array::Ptr parts = new Poco::JSON::Array();
+                for (const auto& part : result.value()) {
+                    Poco::JSON::Object::Ptr item = new Poco::JSON::Object();
+                    item->set("id", part.id);
+                    item->set("upload_id", part.upload_id);
+                    item->set("part_number", part.part_number);
+                    item->set("size_bytes", static_cast<Poco::UInt64>(part.size_bytes));
+                    item->set("etag", part.etag);
+                    item->set("temp_path", part.temp_path);
+                    item->set("created_at", part.created_at);
+                    parts->add(item);
+                }
+                Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                root->set("parts", parts);
+                return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+            }
+
+            if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_DELETE &&
+                path == "/internal/v1/multipart/parts/delete") {
+                std::string upload_id;
+                for (const auto& p : uri.getQueryParameters()) {
+                    if (p.first == "upload_id") upload_id = p.second;
+                }
+                auto result = store_->DeleteMultipartParts(upload_id);
+                if (!result.ok()) {
+                    return WriteError(res, request_id, "INTERNAL_ERROR", result.error().message,
+                                      Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+                }
+                Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                root->set("ok", true);
+                return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+            }
+
+            if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_POST &&
                 path == "/internal/v1/objects/allocate-write") {
                 const auto started_at = std::chrono::steady_clock::now();
                 auto body = ParseBody(req);
