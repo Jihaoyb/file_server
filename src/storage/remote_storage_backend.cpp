@@ -52,13 +52,21 @@ RemoteStorageBackend::RemoteStorageBackend(core::DistributedConfig distributed,
       metadata_(std::move(metadata)),
       temp_path_(std::move(temp_path)) {
     std::filesystem::create_directories(std::filesystem::path(temp_path_) / "remote_cache");
+    std::filesystem::create_directories(std::filesystem::path(temp_path_) / "remote_spool");
 }
 
 core::Result<StoredObject> RemoteStorageBackend::WriteObject(const std::string& bucket,
                                                              const std::string& object,
                                                              std::istream& data) {
-    std::string payload;
-    payload.reserve(64 * 1024);
+    const auto spool_path = (std::filesystem::path(temp_path_) / "remote_spool" /
+                             Poco::UUIDGenerator().createOne().toString())
+                                .string();
+    std::filesystem::create_directories(std::filesystem::path(spool_path).parent_path());
+    std::ofstream spool(spool_path, std::ios::binary | std::ios::trunc);
+    if (!spool.is_open()) {
+        return core::Error{core::ErrorCode::kIoError, "failed to open spool file"};
+    }
+
     std::array<char, 8192> buffer{};
     Poco::SHA2Engine256 sha256;
     std::uint64_t total = 0;
@@ -68,23 +76,37 @@ core::Result<StoredObject> RemoteStorageBackend::WriteObject(const std::string& 
         if (bytes <= 0) {
             break;
         }
-        payload.append(buffer.data(), static_cast<size_t>(bytes));
+        spool.write(buffer.data(), static_cast<std::streamsize>(bytes));
+        if (!spool) {
+            spool.close();
+            std::error_code remove_ec;
+            std::filesystem::remove(spool_path, remove_ec);
+            return core::Error{core::ErrorCode::kIoError, "failed to write spool file"};
+        }
         sha256.update(buffer.data(), static_cast<unsigned int>(bytes));
         total += static_cast<std::uint64_t>(bytes);
     }
+    spool.close();
     const auto etag = Poco::DigestEngine::digestToHex(sha256.digest());
 
     auto allocation = metadata_->AllocateWrite(bucket, object, distributed_.replication_factor,
                                                distributed_.service_auth_token);
     if (!allocation.ok()) {
         nebulafs::observability::RecordGatewayMetadataRpcFailure();
+        std::error_code remove_ec;
+        std::filesystem::remove(spool_path, remove_ec);
         return allocation.error();
     }
 
     std::vector<metadata::ReplicaTarget> written;
     for (const auto& replica : allocation.value().replicas) {
-        auto put = distributed::SendHttpRequest(
-            "PUT", BlobUrl(replica.endpoint, allocation.value().blob_id), payload,
+        std::ifstream in(spool_path, std::ios::binary);
+        if (!in.is_open()) {
+            nebulafs::observability::RecordGatewayStoragePutFailure();
+            continue;
+        }
+        auto put = distributed::SendHttpRequestStream(
+            "PUT", BlobUrl(replica.endpoint, allocation.value().blob_id), in, total,
             "application/octet-stream", distributed_.service_auth_token,
             {{"X-Placement-Token", allocation.value().write_token}});
         if (put.ok() && put.value().status == 200) {
@@ -95,6 +117,8 @@ core::Result<StoredObject> RemoteStorageBackend::WriteObject(const std::string& 
     }
     if (static_cast<int>(written.size()) < distributed_.min_write_acks) {
         BestEffortRollbackWrites(distributed_, allocation.value().blob_id, written);
+        std::error_code remove_ec;
+        std::filesystem::remove(spool_path, remove_ec);
         return core::Error{core::ErrorCode::kIoError, "insufficient storage node write acknowledgements"};
     }
 
@@ -103,8 +127,12 @@ core::Result<StoredObject> RemoteStorageBackend::WriteObject(const std::string& 
     if (!commit.ok()) {
         BestEffortRollbackWrites(distributed_, allocation.value().blob_id, written);
         nebulafs::observability::RecordGatewayMetadataRpcFailure();
+        std::error_code remove_ec;
+        std::filesystem::remove(spool_path, remove_ec);
         return commit.error();
     }
+    std::error_code remove_ec;
+    std::filesystem::remove(spool_path, remove_ec);
 
     StoredObject stored;
     stored.size_bytes = total;
