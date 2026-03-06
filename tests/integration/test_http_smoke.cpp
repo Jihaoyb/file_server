@@ -114,6 +114,19 @@ void CleanupTempDir(const std::filesystem::path& dir) {
     }
 }
 
+std::uint64_t CountRegularFiles(const std::filesystem::path& dir) {
+    if (!std::filesystem::exists(dir)) {
+        return 0;
+    }
+    std::uint64_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.is_regular_file()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 std::filesystem::path WriteServerConfig(const std::filesystem::path& dir,
                                         unsigned short port,
                                         const AuthConfig& auth = {},
@@ -1085,6 +1098,17 @@ TEST(IntegrationHttp, DistributedWriteQuorumFailureKeepsObjectInvisible) {
         ASSERT_EQ(upload.result(), http::status::internal_server_error);
         EXPECT_NE(upload.body().find("insufficient storage node write acknowledgements"),
                   std::string::npos);
+
+        const auto storage1_blob_dir = temp_dir / "storage1" / "storage" / "blobs";
+        bool rollback_completed = false;
+        for (int i = 0; i < 10; ++i) {
+            if (CountRegularFiles(storage1_blob_dir) == 0) {
+                rollback_completed = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        EXPECT_TRUE(rollback_completed);
 
         auto metrics_after = SendRequest(http::verb::get, "127.0.0.1", gateway_port, "/metrics", "",
                                          "");
