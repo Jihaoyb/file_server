@@ -514,6 +514,38 @@ std::optional<long long> ParseMetricCounter(const std::string& metrics, const st
     return std::nullopt;
 }
 
+struct ErrorEnvelope {
+    std::string code;
+    std::string message;
+    std::string request_id;
+};
+
+std::optional<ErrorEnvelope> ParseErrorEnvelope(const std::string& body) {
+    try {
+        Poco::JSON::Parser parser;
+        auto root = parser.parse(body).extract<Poco::JSON::Object::Ptr>();
+        auto error = root->getObject("error");
+        if (!error) {
+            return std::nullopt;
+        }
+        ErrorEnvelope envelope;
+        envelope.code = error->getValue<std::string>("code");
+        envelope.message = error->getValue<std::string>("message");
+        envelope.request_id = error->getValue<std::string>("request_id");
+        return envelope;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+void ExpectErrorEnvelope(const http::response<http::string_body>& response,
+                         const std::string& expected_code) {
+    const auto envelope = ParseErrorEnvelope(response.body());
+    ASSERT_TRUE(envelope.has_value());
+    EXPECT_EQ(envelope->code, expected_code);
+    EXPECT_FALSE(envelope->request_id.empty());
+}
+
 }  // namespace
 
 TEST(IntegrationHttp, BasicCrudSmoke) {
@@ -1178,11 +1210,13 @@ TEST(IntegrationHttp, DistributedInternalEndpointsRejectInvalidServiceToken) {
         auto metadata_no_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
                                              "/internal/v1/buckets/list", "", "");
         EXPECT_EQ(metadata_no_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(metadata_no_token, "UNAUTHORIZED");
 
         auto metadata_bad_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
                                               "/internal/v1/buckets/list", "", "",
                                               {{"Authorization", "Bearer wrong-token"}});
         EXPECT_EQ(metadata_bad_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(metadata_bad_token, "UNAUTHORIZED");
 
         auto metadata_good_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
                                                "/internal/v1/buckets/list", "", "",
@@ -1193,26 +1227,31 @@ TEST(IntegrationHttp, DistributedInternalEndpointsRejectInvalidServiceToken) {
             http::verb::post, "127.0.0.1", metadata_port, "/internal/v1/objects/allocate-write",
             R"({"bucket":"missing","object":"ghost.txt","replication_factor":1,"service_token":"distributed-test-token"})",
             "application/json", {{"Authorization", "Bearer " + token}});
-        EXPECT_EQ(metadata_allocate_invalid.result(), http::status::internal_server_error);
+        EXPECT_EQ(metadata_allocate_invalid.result(), http::status::not_found);
+        ExpectErrorEnvelope(metadata_allocate_invalid, "NOT_FOUND");
 
         auto storage_no_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
                                             "/internal/v1/blobs/test-blob", "", "");
         EXPECT_EQ(storage_no_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(storage_no_token, "UNAUTHORIZED");
 
         auto storage_bad_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
                                              "/internal/v1/blobs/test-blob", "", "",
                                              {{"Authorization", "Bearer wrong-token"}});
         EXPECT_EQ(storage_bad_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(storage_bad_token, "UNAUTHORIZED");
 
         auto storage_good_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
                                               "/internal/v1/blobs/test-blob", "", "",
                                               {{"Authorization", "Bearer " + token}});
         EXPECT_EQ(storage_good_token.result(), http::status::not_found);
+        ExpectErrorEnvelope(storage_good_token, "NOT_FOUND");
 
         auto storage_missing_placement = SendRequest(
             http::verb::put, "127.0.0.1", storage_port, "/internal/v1/blobs/test-blob", "abc",
             "application/octet-stream", {{"Authorization", "Bearer " + token}});
         EXPECT_EQ(storage_missing_placement.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(storage_missing_placement, "UNAUTHORIZED");
 
         auto metadata_metrics_after =
             SendRequest(http::verb::get, "127.0.0.1", metadata_port, "/metrics", "", "");
