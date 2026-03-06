@@ -9,6 +9,7 @@
 #include <Poco/SHA2Engine.h>
 #include <Poco/UUIDGenerator.h>
 
+#include "nebulafs/core/logger.h"
 #include "nebulafs/distributed/http_client.h"
 #include "nebulafs/observability/metrics.h"
 
@@ -20,6 +21,26 @@ std::string BlobUrl(const std::string& endpoint, const std::string& blob_id) {
         return endpoint.substr(0, endpoint.size() - 1) + "/internal/v1/blobs/" + blob_id;
     }
     return endpoint + "/internal/v1/blobs/" + blob_id;
+}
+
+void BestEffortRollbackWrites(const core::DistributedConfig& distributed,
+                              const std::string& blob_id,
+                              const std::vector<metadata::ReplicaTarget>& written) {
+    // Roll back already-written replicas to avoid orphan blobs on failed distributed writes.
+    for (const auto& replica : written) {
+        auto del = distributed::SendHttpRequest("DELETE", BlobUrl(replica.endpoint, blob_id), "", "",
+                                                distributed.service_auth_token, {});
+        if (!del.ok()) {
+            core::LogError("distributed rollback delete failed: " + del.error().message);
+            nebulafs::observability::RecordGatewayStoragePutFailure();
+            continue;
+        }
+        if (del.value().status != 200 && del.value().status != 404) {
+            core::LogError("distributed rollback delete returned status " +
+                           std::to_string(del.value().status));
+            nebulafs::observability::RecordGatewayStoragePutFailure();
+        }
+    }
 }
 
 }  // namespace
@@ -73,12 +94,14 @@ core::Result<StoredObject> RemoteStorageBackend::WriteObject(const std::string& 
         }
     }
     if (static_cast<int>(written.size()) < distributed_.min_write_acks) {
+        BestEffortRollbackWrites(distributed_, allocation.value().blob_id, written);
         return core::Error{core::ErrorCode::kIoError, "insufficient storage node write acknowledgements"};
     }
 
     auto commit =
         metadata_->CommitWrite(bucket, object, allocation.value().blob_id, total, etag, written);
     if (!commit.ok()) {
+        BestEffortRollbackWrites(distributed_, allocation.value().blob_id, written);
         nebulafs::observability::RecordGatewayMetadataRpcFailure();
         return commit.error();
     }

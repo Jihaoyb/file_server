@@ -10,14 +10,16 @@ NebulaFS is a production-grade, cloud-storage style file server written in C++20
 - **Structured logging** via Poco with request correlation.
 - **Security-first** design with OIDC/JWT auth and JWKS validation support.
 
-## Architecture (Milestone 0–4)
+## Architecture (Milestone 0–6 baseline)
 
 ```mermaid
 flowchart LR
   client(("Client")) -->|"HTTPS"| gateway["HTTP Server"]
   gateway --> auth["Auth (OIDC/JWT + JWKS)"]
-  gateway --> storage["Local Storage Engine"]
-  gateway --> metadata["SQLite Metadata"]
+  gateway --> local_storage["Local Storage Engine (single_node)"]
+  gateway --> local_metadata["SQLite Metadata (single_node)"]
+  gateway --> metadata_svc["Metadata Service (distributed)"]
+  gateway --> storage_nodes["Storage Nodes (distributed)"]
   gateway --> observability["Metrics/Health"]
 ```
 
@@ -49,6 +51,31 @@ Gateway distributed mode is enabled with:
 - `distributed.metadata_base_url`
 - `distributed.storage_nodes`
 - `distributed.service_auth_token`
+
+### Distributed observability metrics (Milestone 6)
+Distributed mode now emits service-specific counters and latency sums via `/metrics`.
+
+- Gateway:
+  - `nebulafs_gateway_storage_put_failures_total`
+  - `nebulafs_gateway_metadata_rpc_failures_total`
+  - `nebulafs_gateway_replica_fallback_total`
+- Metadata service:
+  - `nebulafs_metadata_allocate_requests_total`
+  - `nebulafs_metadata_allocate_failures_total`
+  - `nebulafs_metadata_allocate_latency_ms_sum`
+  - `nebulafs_metadata_commit_requests_total`
+  - `nebulafs_metadata_commit_failures_total`
+  - `nebulafs_metadata_commit_latency_ms_sum`
+- Storage node service:
+  - `nebulafs_storage_node_blob_writes_total`
+  - `nebulafs_storage_node_blob_write_failures_total`
+  - `nebulafs_storage_node_blob_write_latency_ms_sum`
+  - `nebulafs_storage_node_blob_reads_total`
+  - `nebulafs_storage_node_blob_read_failures_total`
+  - `nebulafs_storage_node_blob_read_latency_ms_sum`
+  - `nebulafs_storage_node_blob_deletes_total`
+  - `nebulafs_storage_node_blob_delete_failures_total`
+  - `nebulafs_storage_node_blob_delete_latency_ms_sum`
 
 ### Traffic controls
 `config/server.json` supports:
@@ -105,7 +132,7 @@ curl http://localhost:8080/v1/buckets/demo/objects/readme.txt -o readme.txt
 curl "http://localhost:8080/v1/buckets/demo/objects?prefix=read"
 ```
 
-Note: multipart upload endpoints are currently single-node only; distributed mode focuses on object CRUD baseline in Milestone 6.
+Note: multipart upload endpoints are currently single-node only. Distributed mode in Milestone 6 focuses on object CRUD baseline, and gateway upload fan-out is currently buffered in memory (not true streaming fan-out yet).
 
 ### Authentication test (Keycloak local)
 
@@ -176,7 +203,14 @@ Troubleshooting:
 - **Milestone 3.1**: Startup auth config hardening (completed).
 - **Milestone 4**: Multipart uploads and cleanup baseline (completed).
 - **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts (completed).
-- **Milestone 6**: Distributed mode with metadata service and storage nodes (design in progress).
+- **Milestone 6**: Distributed baseline implemented (gateway + metadata service + storage nodes + distributed CI lane).
+
+### Milestone 6 completion criteria
+- Distributed mode keeps public object CRUD routes unchanged at the gateway.
+- Metadata and storage-node internal services run as separate binaries with service-token checks.
+- Distributed failure correctness is covered in integration tests (read fallback, write quorum failure, token rejection).
+- Distributed metrics are exposed and validated for gateway, metadata service, and storage node.
+- Deferred to next milestone: distributed multipart APIs and true streaming write fan-out.
 
 ## Docs
 - Architecture: `docs/architecture.md`

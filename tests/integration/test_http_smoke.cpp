@@ -114,6 +114,19 @@ void CleanupTempDir(const std::filesystem::path& dir) {
     }
 }
 
+std::uint64_t CountRegularFiles(const std::filesystem::path& dir) {
+    if (!std::filesystem::exists(dir)) {
+        return 0;
+    }
+    std::uint64_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.is_regular_file()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 std::filesystem::path WriteServerConfig(const std::filesystem::path& dir,
                                         unsigned short port,
                                         const AuthConfig& auth = {},
@@ -501,6 +514,38 @@ std::optional<long long> ParseMetricCounter(const std::string& metrics, const st
     return std::nullopt;
 }
 
+struct ErrorEnvelope {
+    std::string code;
+    std::string message;
+    std::string request_id;
+};
+
+std::optional<ErrorEnvelope> ParseErrorEnvelope(const std::string& body) {
+    try {
+        Poco::JSON::Parser parser;
+        auto root = parser.parse(body).extract<Poco::JSON::Object::Ptr>();
+        auto error = root->getObject("error");
+        if (!error) {
+            return std::nullopt;
+        }
+        ErrorEnvelope envelope;
+        envelope.code = error->getValue<std::string>("code");
+        envelope.message = error->getValue<std::string>("message");
+        envelope.request_id = error->getValue<std::string>("request_id");
+        return envelope;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+void ExpectErrorEnvelope(const http::response<http::string_body>& response,
+                         const std::string& expected_code) {
+    const auto envelope = ParseErrorEnvelope(response.body());
+    ASSERT_TRUE(envelope.has_value());
+    EXPECT_EQ(envelope->code, expected_code);
+    EXPECT_FALSE(envelope->request_id.empty());
+}
+
 }  // namespace
 
 TEST(IntegrationHttp, BasicCrudSmoke) {
@@ -859,6 +904,76 @@ TEST(IntegrationHttp, DistributedCrudSmoke) {
         auto del = SendRequest(http::verb::delete_, "127.0.0.1", gateway_port,
                                "/v1/buckets/demo/objects/readme.txt", "", "");
         ASSERT_EQ(del.result(), http::status::ok);
+
+        auto metadata_metrics =
+            SendRequest(http::verb::get, "127.0.0.1", metadata_port, "/metrics", "", "");
+        ASSERT_EQ(metadata_metrics.result(), http::status::ok);
+        auto metadata_allocate =
+            ParseMetricCounter(metadata_metrics.body(), "nebulafs_metadata_allocate_requests_total");
+        auto metadata_commit =
+            ParseMetricCounter(metadata_metrics.body(), "nebulafs_metadata_commit_requests_total");
+        auto metadata_allocate_failures =
+            ParseMetricCounter(metadata_metrics.body(), "nebulafs_metadata_allocate_failures_total");
+        auto metadata_commit_failures =
+            ParseMetricCounter(metadata_metrics.body(), "nebulafs_metadata_commit_failures_total");
+        auto metadata_allocate_latency = ParseMetricCounter(
+            metadata_metrics.body(), "nebulafs_metadata_allocate_latency_ms_sum");
+        auto metadata_commit_latency = ParseMetricCounter(
+            metadata_metrics.body(), "nebulafs_metadata_commit_latency_ms_sum");
+        ASSERT_TRUE(metadata_allocate.has_value());
+        ASSERT_TRUE(metadata_commit.has_value());
+        ASSERT_TRUE(metadata_allocate_failures.has_value());
+        ASSERT_TRUE(metadata_commit_failures.has_value());
+        ASSERT_TRUE(metadata_allocate_latency.has_value());
+        ASSERT_TRUE(metadata_commit_latency.has_value());
+        EXPECT_GE(*metadata_allocate, 1);
+        EXPECT_GE(*metadata_commit, 1);
+
+        auto storage1_metrics =
+            SendRequest(http::verb::get, "127.0.0.1", storage1_port, "/metrics", "", "");
+        auto storage2_metrics =
+            SendRequest(http::verb::get, "127.0.0.1", storage2_port, "/metrics", "", "");
+        ASSERT_EQ(storage1_metrics.result(), http::status::ok);
+        ASSERT_EQ(storage2_metrics.result(), http::status::ok);
+
+        auto storage1_writes = ParseMetricCounter(storage1_metrics.body(),
+                                                  "nebulafs_storage_node_blob_writes_total");
+        auto storage2_writes = ParseMetricCounter(storage2_metrics.body(),
+                                                  "nebulafs_storage_node_blob_writes_total");
+        auto storage1_deletes = ParseMetricCounter(storage1_metrics.body(),
+                                                   "nebulafs_storage_node_blob_deletes_total");
+        auto storage2_deletes = ParseMetricCounter(storage2_metrics.body(),
+                                                   "nebulafs_storage_node_blob_deletes_total");
+        auto storage1_reads = ParseMetricCounter(storage1_metrics.body(),
+                                                 "nebulafs_storage_node_blob_reads_total");
+        auto storage1_write_failures = ParseMetricCounter(
+            storage1_metrics.body(), "nebulafs_storage_node_blob_write_failures_total");
+        auto storage1_read_failures = ParseMetricCounter(
+            storage1_metrics.body(), "nebulafs_storage_node_blob_read_failures_total");
+        auto storage1_delete_failures = ParseMetricCounter(
+            storage1_metrics.body(), "nebulafs_storage_node_blob_delete_failures_total");
+        auto storage1_write_latency = ParseMetricCounter(
+            storage1_metrics.body(), "nebulafs_storage_node_blob_write_latency_ms_sum");
+        auto storage1_read_latency = ParseMetricCounter(
+            storage1_metrics.body(), "nebulafs_storage_node_blob_read_latency_ms_sum");
+        auto storage1_delete_latency = ParseMetricCounter(
+            storage1_metrics.body(), "nebulafs_storage_node_blob_delete_latency_ms_sum");
+        ASSERT_TRUE(storage1_writes.has_value());
+        ASSERT_TRUE(storage2_writes.has_value());
+        ASSERT_TRUE(storage1_deletes.has_value());
+        ASSERT_TRUE(storage2_deletes.has_value());
+        ASSERT_TRUE(storage1_reads.has_value());
+        ASSERT_TRUE(storage1_write_failures.has_value());
+        ASSERT_TRUE(storage1_read_failures.has_value());
+        ASSERT_TRUE(storage1_delete_failures.has_value());
+        ASSERT_TRUE(storage1_write_latency.has_value());
+        ASSERT_TRUE(storage1_read_latency.has_value());
+        ASSERT_TRUE(storage1_delete_latency.has_value());
+        EXPECT_GE(*storage1_writes, 1);
+        EXPECT_GE(*storage2_writes, 1);
+        EXPECT_GE(*storage1_deletes, 1);
+        EXPECT_GE(*storage2_deletes, 1);
+        EXPECT_GE(*storage1_reads, 1);
     }
 
     CleanupTempDir(temp_dir);
@@ -1016,6 +1131,17 @@ TEST(IntegrationHttp, DistributedWriteQuorumFailureKeepsObjectInvisible) {
         EXPECT_NE(upload.body().find("insufficient storage node write acknowledgements"),
                   std::string::npos);
 
+        const auto storage1_blob_dir = temp_dir / "storage1" / "storage" / "blobs";
+        bool rollback_completed = false;
+        for (int i = 0; i < 10; ++i) {
+            if (CountRegularFiles(storage1_blob_dir) == 0) {
+                rollback_completed = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        EXPECT_TRUE(rollback_completed);
+
         auto metrics_after = SendRequest(http::verb::get, "127.0.0.1", gateway_port, "/metrics", "",
                                          "");
         ASSERT_EQ(metrics_after.result(), http::status::ok);
@@ -1064,38 +1190,88 @@ TEST(IntegrationHttp, DistributedInternalEndpointsRejectInvalidServiceToken) {
         ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
         ASSERT_TRUE(WaitForHealth("127.0.0.1", storage_port));
 
+        auto metadata_metrics_before =
+            SendRequest(http::verb::get, "127.0.0.1", metadata_port, "/metrics", "", "");
+        ASSERT_EQ(metadata_metrics_before.result(), http::status::ok);
+        auto metadata_allocate_failures_before = ParseMetricCounter(
+            metadata_metrics_before.body(), "nebulafs_metadata_allocate_failures_total");
+        ASSERT_TRUE(metadata_allocate_failures_before.has_value());
+
+        auto storage_metrics_before =
+            SendRequest(http::verb::get, "127.0.0.1", storage_port, "/metrics", "", "");
+        ASSERT_EQ(storage_metrics_before.result(), http::status::ok);
+        auto storage_read_failures_before = ParseMetricCounter(
+            storage_metrics_before.body(), "nebulafs_storage_node_blob_read_failures_total");
+        auto storage_write_failures_before = ParseMetricCounter(
+            storage_metrics_before.body(), "nebulafs_storage_node_blob_write_failures_total");
+        ASSERT_TRUE(storage_read_failures_before.has_value());
+        ASSERT_TRUE(storage_write_failures_before.has_value());
+
         auto metadata_no_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
                                              "/internal/v1/buckets/list", "", "");
         EXPECT_EQ(metadata_no_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(metadata_no_token, "UNAUTHORIZED");
 
         auto metadata_bad_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
                                               "/internal/v1/buckets/list", "", "",
                                               {{"Authorization", "Bearer wrong-token"}});
         EXPECT_EQ(metadata_bad_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(metadata_bad_token, "UNAUTHORIZED");
 
         auto metadata_good_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
                                                "/internal/v1/buckets/list", "", "",
                                                {{"Authorization", "Bearer " + token}});
         EXPECT_EQ(metadata_good_token.result(), http::status::ok);
 
+        auto metadata_allocate_invalid = SendRequest(
+            http::verb::post, "127.0.0.1", metadata_port, "/internal/v1/objects/allocate-write",
+            R"({"bucket":"missing","object":"ghost.txt","replication_factor":1,"service_token":"distributed-test-token"})",
+            "application/json", {{"Authorization", "Bearer " + token}});
+        EXPECT_EQ(metadata_allocate_invalid.result(), http::status::not_found);
+        ExpectErrorEnvelope(metadata_allocate_invalid, "NOT_FOUND");
+
         auto storage_no_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
                                             "/internal/v1/blobs/test-blob", "", "");
         EXPECT_EQ(storage_no_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(storage_no_token, "UNAUTHORIZED");
 
         auto storage_bad_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
                                              "/internal/v1/blobs/test-blob", "", "",
                                              {{"Authorization", "Bearer wrong-token"}});
         EXPECT_EQ(storage_bad_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(storage_bad_token, "UNAUTHORIZED");
 
         auto storage_good_token = SendRequest(http::verb::get, "127.0.0.1", storage_port,
                                               "/internal/v1/blobs/test-blob", "", "",
                                               {{"Authorization", "Bearer " + token}});
         EXPECT_EQ(storage_good_token.result(), http::status::not_found);
+        ExpectErrorEnvelope(storage_good_token, "NOT_FOUND");
 
         auto storage_missing_placement = SendRequest(
             http::verb::put, "127.0.0.1", storage_port, "/internal/v1/blobs/test-blob", "abc",
             "application/octet-stream", {{"Authorization", "Bearer " + token}});
         EXPECT_EQ(storage_missing_placement.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(storage_missing_placement, "UNAUTHORIZED");
+
+        auto metadata_metrics_after =
+            SendRequest(http::verb::get, "127.0.0.1", metadata_port, "/metrics", "", "");
+        ASSERT_EQ(metadata_metrics_after.result(), http::status::ok);
+        auto metadata_allocate_failures_after = ParseMetricCounter(
+            metadata_metrics_after.body(), "nebulafs_metadata_allocate_failures_total");
+        ASSERT_TRUE(metadata_allocate_failures_after.has_value());
+        EXPECT_GT(*metadata_allocate_failures_after, *metadata_allocate_failures_before);
+
+        auto storage_metrics_after =
+            SendRequest(http::verb::get, "127.0.0.1", storage_port, "/metrics", "", "");
+        ASSERT_EQ(storage_metrics_after.result(), http::status::ok);
+        auto storage_read_failures_after = ParseMetricCounter(
+            storage_metrics_after.body(), "nebulafs_storage_node_blob_read_failures_total");
+        auto storage_write_failures_after = ParseMetricCounter(
+            storage_metrics_after.body(), "nebulafs_storage_node_blob_write_failures_total");
+        ASSERT_TRUE(storage_read_failures_after.has_value());
+        ASSERT_TRUE(storage_write_failures_after.has_value());
+        EXPECT_GT(*storage_read_failures_after, *storage_read_failures_before);
+        EXPECT_GT(*storage_write_failures_after, *storage_write_failures_before);
     }
 
     CleanupTempDir(temp_dir);

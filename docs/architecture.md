@@ -4,17 +4,20 @@
 
 - `core/`: configuration, logging, IDs, error handling.
 - `http/`: Beast-based HTTP server, routing, request context.
-- `storage/`: filesystem storage engine with atomic writes.
-- `metadata/`: SQLite-backed metadata store.
+- `storage/`: storage backends (`LocalStorage`, `RemoteStorageBackend`) and storage-node service.
+- `metadata/`: metadata backends (`SqliteMetadataStore`, `RemoteMetadataStore`) and metadata service.
 - `auth/`: JWT parsing/verification with JWKS cache.
 - `observability/`: health, readiness, metrics.
+- `distributed/`: internal HTTP client + placement token signing/validation.
 
-## Planned Milestone 4 extensions
+## Runtime Modes
 
-- Multipart upload coordinator (initiate, part upload, complete, abort).
-- Multipart metadata tables for in-progress uploads and parts.
-- Background cleanup sweep for expired/incomplete uploads.
-- Additional multipart metrics (throughput, failures, cleanup activity).
+- `single_node` (default):
+  - gateway serves public API and uses local filesystem + local SQLite metadata.
+- `distributed`:
+  - gateway remains public API surface and orchestrates writes/reads via internal services.
+  - metadata service owns placement + object visibility state.
+  - storage nodes own blob bytes and internal blob CRUD endpoints.
 
 ## Concurrency Model
 
@@ -22,23 +25,39 @@
 - Each connection is managed by a session object using a strand.
 - HTTP parsing uses Beast; request bodies are streamed to storage.
 
-## Storage Layout
+## Storage Layout (single_node and storage-node local disk)
 
 ```
 <base_path>/
-  buckets/
+  buckets/                # single_node object layout
     <bucket>/
       objects/
         <object>
+  blobs/                  # storage-node blob layout
+    <blob_id>
 ```
 
 Uploads are written to `<base_path>/tmp/<uuid>` then `fsync` + `rename` to final path.
 
-## Metadata Schema (SQLite)
+## Metadata Schema (SQLite baseline)
 
 - `buckets(id, name, created_at)`
 - `objects(id, bucket_id, name, size_bytes, etag, created_at, updated_at)`
+- `storage_nodes(id, endpoint, status, updated_at)`
+- `object_replicas(object_id, node_id, blob_id, replica_index, state, checksum, updated_at)`
 
 ## Error Handling
 
 - Internal code uses a `Result<T>` type; HTTP errors return a JSON envelope with a request ID.
+
+## Milestone 6 Status
+
+- Implemented baseline:
+  - distributed object CRUD flow (`allocate-write -> storage PUTs -> commit -> resolve-read`)
+  - replica fallback on read
+  - write quorum enforcement
+  - distributed integration lane in CI
+  - gateway/metadata/storage-node metrics
+- Deferred:
+  - distributed multipart upload APIs
+  - true gateway streaming fan-out writes (current implementation buffers payload during fan-out)
