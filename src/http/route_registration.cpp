@@ -17,6 +17,7 @@
 #include <Poco/UUIDGenerator.h>
 
 #include "nebulafs/core/time.h"
+#include "nebulafs/distributed/http_client.h"
 #include "nebulafs/metadata/metadata_store.h"
 #include "nebulafs/observability/metrics.h"
 #include "nebulafs/storage/local_storage.h"
@@ -58,6 +59,69 @@ std::optional<int> ParsePositiveInt(const std::string& value) {
     } catch (const std::exception&) {
         return std::nullopt;
     }
+}
+
+std::string BlobUrl(const std::string& endpoint, const std::string& blob_id) {
+    if (!endpoint.empty() && endpoint.back() == '/') {
+        return endpoint.substr(0, endpoint.size() - 1) + "/internal/v1/blobs/" + blob_id;
+    }
+    return endpoint + "/internal/v1/blobs/" + blob_id;
+}
+
+struct DistributedPartLocator {
+    std::string blob_id;
+    std::vector<std::string> endpoints;
+};
+
+std::string EncodePartLocator(const DistributedPartLocator& locator) {
+    std::ostringstream ss;
+    ss << locator.blob_id << "|";
+    for (size_t i = 0; i < locator.endpoints.size(); ++i) {
+        if (i > 0) {
+            ss << ",";
+        }
+        ss << locator.endpoints[i];
+    }
+    return ss.str();
+}
+
+std::optional<DistributedPartLocator> DecodePartLocator(const std::string& encoded) {
+    const auto sep = encoded.find('|');
+    if (sep == std::string::npos) {
+        return std::nullopt;
+    }
+    DistributedPartLocator locator;
+    locator.blob_id = encoded.substr(0, sep);
+    std::stringstream ss(encoded.substr(sep + 1));
+    std::string endpoint;
+    while (std::getline(ss, endpoint, ',')) {
+        if (!endpoint.empty()) {
+            locator.endpoints.push_back(endpoint);
+        }
+    }
+    if (locator.blob_id.empty() || locator.endpoints.empty()) {
+        return std::nullopt;
+    }
+    return locator;
+}
+
+void BestEffortDeletePartBlob(const DistributedPartLocator& locator, const std::string& token) {
+    for (const auto& endpoint : locator.endpoints) {
+        (void)distributed::SendHttpRequest("DELETE", BlobUrl(endpoint, locator.blob_id), "", "",
+                                           token, {});
+    }
+}
+
+core::Result<std::string> ReadPartBlob(const DistributedPartLocator& locator,
+                                       const std::string& token) {
+    for (const auto& endpoint : locator.endpoints) {
+        auto get =
+            distributed::SendHttpRequest("GET", BlobUrl(endpoint, locator.blob_id), "", "", token, {});
+        if (get.ok() && get.value().status == 200) {
+            return get.value().body;
+        }
+    }
+    return core::Error{core::ErrorCode::kIoError, "failed to fetch multipart part blob"};
 }
 
 std::string MultipartPartPath(const std::string& temp_root, const std::string& upload_id,
@@ -572,6 +636,348 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataBac
                    HttpResponse response{boost::beast::http::status::no_content, req.version()};
                    return response;
                });
+    } else {
+        router.Add("POST", "/v1/buckets/{bucket}/multipart-uploads",
+                   [metadata, ttl_seconds = config.storage.multipart.max_upload_ttl_seconds](
+                       const RequestContext& ctx, const HttpRequest& req,
+                       const RouteParams& params) {
+                       const auto bucket = params.at("bucket");
+                       if (!storage::LocalStorage::IsSafeName(bucket)) {
+                           return JsonError(req.version(), "INVALID_NAME", "invalid bucket name",
+                                            ctx.request_id,
+                                            boost::beast::http::status::bad_request);
+                       }
+                       auto bucket_exists = metadata->GetBucket(bucket);
+                       if (!bucket_exists.ok()) {
+                           return JsonError(req.version(), "BUCKET_NOT_FOUND", "bucket not found",
+                                            ctx.request_id, boost::beast::http::status::not_found);
+                       }
+
+                       try {
+                           Poco::JSON::Parser parser;
+                           auto result = parser.parse(req.body());
+                           auto obj = result.extract<Poco::JSON::Object::Ptr>();
+                           auto object_name = obj->getValue<std::string>("object");
+                           if (!storage::LocalStorage::IsSafeName(object_name)) {
+                               return JsonError(req.version(), "INVALID_NAME", "invalid object name",
+                                                ctx.request_id,
+                                                boost::beast::http::status::bad_request);
+                           }
+
+                           const auto upload_id = Poco::UUIDGenerator().createOne().toString();
+                           const auto expires_at = core::NowIso8601WithOffsetSeconds(ttl_seconds);
+                           auto created =
+                               metadata->CreateMultipartUpload(bucket, upload_id, object_name, expires_at);
+                           if (!created.ok()) {
+                               return JsonError(req.version(), "DB_ERROR", created.error().message,
+                                                ctx.request_id,
+                                                boost::beast::http::status::internal_server_error);
+                           }
+
+                           return JsonOk(req.version(),
+                                         "{\"upload_id\":\"" + upload_id + "\",\"object\":\"" +
+                                             object_name + "\",\"expires_at\":\"" + expires_at + "\"}");
+                       } catch (const std::exception& ex) {
+                           return JsonError(req.version(), "INVALID_JSON", ex.what(), ctx.request_id,
+                                            boost::beast::http::status::bad_request);
+                       }
+                   });
+
+        router.Add("PUT", "/v1/buckets/{bucket}/multipart-uploads/{upload_id}/parts/{part_number}",
+                   [metadata, service_token = config.distributed.service_auth_token,
+                    replication_factor = config.distributed.replication_factor,
+                    min_write_acks = config.distributed.min_write_acks](
+                       const RequestContext& ctx, const HttpRequest& req, const RouteParams& params) {
+                       const auto bucket = params.at("bucket");
+                       const auto upload_id = params.at("upload_id");
+                       const auto part_number_text = params.at("part_number");
+                       auto part_number = ParsePositiveInt(part_number_text);
+                       if (!part_number) {
+                           return JsonError(req.version(), "INVALID_PART_NUMBER",
+                                            "part_number must be positive integer", ctx.request_id,
+                                            boost::beast::http::status::bad_request);
+                       }
+
+                       int bucket_id = 0;
+                       metadata::MultipartUpload upload;
+                       auto validated =
+                           ValidateUploadForBucket(metadata.get(), bucket, upload_id, &bucket_id, &upload);
+                       if (!validated.ok()) {
+                           const auto status =
+                               validated.error().code == core::ErrorCode::kNotFound
+                                   ? boost::beast::http::status::not_found
+                                   : boost::beast::http::status::internal_server_error;
+                           return JsonError(req.version(), "UPLOAD_NOT_FOUND",
+                                            validated.error().message, ctx.request_id, status);
+                       }
+                       if (upload.state == "completed" || upload.state == "aborted" ||
+                           upload.state == "expired") {
+                           return JsonError(req.version(), "INVALID_STATE", "upload is not writable",
+                                            ctx.request_id, boost::beast::http::status::conflict);
+                       }
+
+                       Poco::SHA2Engine256 sha256;
+                       sha256.update(req.body().data(), static_cast<unsigned int>(req.body().size()));
+                       const auto etag = Poco::DigestEngine::digestToHex(sha256.digest());
+
+                       const auto part_object_name =
+                           upload.object_name + ".part." + std::to_string(*part_number);
+                       auto plan = metadata->AllocateWrite(bucket, part_object_name, replication_factor,
+                                                           service_token);
+                       if (!plan.ok()) {
+                           return JsonError(req.version(), "ALLOCATE_FAILED", plan.error().message,
+                                            ctx.request_id,
+                                            boost::beast::http::status::internal_server_error);
+                       }
+
+                       DistributedPartLocator locator;
+                       locator.blob_id = plan.value().blob_id;
+                       for (const auto& replica : plan.value().replicas) {
+                           auto put = distributed::SendHttpRequest(
+                               "PUT", BlobUrl(replica.endpoint, plan.value().blob_id), req.body(),
+                               "application/octet-stream", service_token,
+                               {{"X-Placement-Token", plan.value().write_token}});
+                           if (put.ok() && put.value().status == 200) {
+                               locator.endpoints.push_back(replica.endpoint);
+                           }
+                       }
+
+                       if (static_cast<int>(locator.endpoints.size()) < min_write_acks) {
+                           BestEffortDeletePartBlob(locator, service_token);
+                           return JsonError(
+                               req.version(), "IO_ERROR",
+                               "insufficient storage node write acknowledgements for multipart part",
+                               ctx.request_id, boost::beast::http::status::internal_server_error);
+                       }
+
+                       auto part = metadata->UpsertMultipartPart(
+                           upload_id, *part_number, static_cast<std::uint64_t>(req.body().size()), etag,
+                           EncodePartLocator(locator));
+                       if (!part.ok()) {
+                           BestEffortDeletePartBlob(locator, service_token);
+                           return JsonError(req.version(), "DB_ERROR", part.error().message,
+                                            ctx.request_id,
+                                            boost::beast::http::status::internal_server_error);
+                       }
+                       auto state_update = metadata->UpdateMultipartUploadState(upload_id, "uploading");
+                       if (!state_update.ok()) {
+                           return JsonError(req.version(), "DB_ERROR", state_update.error().message,
+                                            ctx.request_id,
+                                            boost::beast::http::status::internal_server_error);
+                       }
+
+                       return JsonOk(req.version(),
+                                     "{\"upload_id\":\"" + upload_id + "\",\"part_number\":" +
+                                         std::to_string(*part_number) + ",\"etag\":\"" + etag +
+                                         "\",\"size\":" + std::to_string(req.body().size()) + "}");
+                   });
+
+        router.Add("GET", "/v1/buckets/{bucket}/multipart-uploads/{upload_id}/parts",
+                   [metadata](const RequestContext& ctx, const HttpRequest& req,
+                              const RouteParams& params) {
+                       const auto bucket = params.at("bucket");
+                       const auto upload_id = params.at("upload_id");
+
+                       int bucket_id = 0;
+                       metadata::MultipartUpload upload;
+                       auto validated =
+                           ValidateUploadForBucket(metadata.get(), bucket, upload_id, &bucket_id, &upload);
+                       if (!validated.ok()) {
+                           return JsonError(req.version(), "UPLOAD_NOT_FOUND",
+                                            validated.error().message, ctx.request_id,
+                                            boost::beast::http::status::not_found);
+                       }
+
+                       auto parts = metadata->ListMultipartParts(upload_id);
+                       if (!parts.ok()) {
+                           return JsonError(req.version(), "DB_ERROR", parts.error().message,
+                                            ctx.request_id,
+                                            boost::beast::http::status::internal_server_error);
+                       }
+
+                       Poco::JSON::Array::Ptr arr = new Poco::JSON::Array();
+                       for (const auto& part : parts.value()) {
+                           Poco::JSON::Object::Ptr item = new Poco::JSON::Object();
+                           item->set("part_number", part.part_number);
+                           item->set("size", static_cast<Poco::UInt64>(part.size_bytes));
+                           item->set("etag", part.etag);
+                           arr->add(item);
+                       }
+                       Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+                       root->set("upload_id", upload_id);
+                       root->set("object", upload.object_name);
+                       root->set("state", upload.state);
+                       root->set("parts", arr);
+                       std::stringstream ss;
+                       root->stringify(ss);
+                       return JsonOk(req.version(), ss.str());
+                   });
+
+        router.Add("POST", "/v1/buckets/{bucket}/multipart-uploads/{upload_id}/complete",
+                   [metadata, storage, service_token = config.distributed.service_auth_token](
+                       const RequestContext& ctx, const HttpRequest& req, const RouteParams& params) {
+                       const auto bucket = params.at("bucket");
+                       const auto upload_id = params.at("upload_id");
+
+                       int bucket_id = 0;
+                       metadata::MultipartUpload upload;
+                       auto validated =
+                           ValidateUploadForBucket(metadata.get(), bucket, upload_id, &bucket_id, &upload);
+                       if (!validated.ok()) {
+                           return JsonError(req.version(), "UPLOAD_NOT_FOUND",
+                                            validated.error().message, ctx.request_id,
+                                            boost::beast::http::status::not_found);
+                       }
+                       if (upload.state == "completed" || upload.state == "aborted" ||
+                           upload.state == "expired") {
+                           return JsonError(req.version(), "INVALID_STATE", "upload is not completable",
+                                            ctx.request_id, boost::beast::http::status::conflict);
+                       }
+
+                       auto expected_parts = ParseCompleteParts(req.body());
+                       if (!expected_parts.ok()) {
+                           return JsonError(req.version(), "INVALID_JSON",
+                                            expected_parts.error().message, ctx.request_id,
+                                            boost::beast::http::status::bad_request);
+                       }
+
+                       auto listed_parts = metadata->ListMultipartParts(upload_id);
+                       if (!listed_parts.ok()) {
+                           return JsonError(req.version(), "DB_ERROR", listed_parts.error().message,
+                                            ctx.request_id,
+                                            boost::beast::http::status::internal_server_error);
+                       }
+                       if (listed_parts.value().empty()) {
+                           return JsonError(req.version(), "INVALID_STATE", "no parts uploaded",
+                                            ctx.request_id, boost::beast::http::status::conflict);
+                       }
+
+                       std::unordered_map<int, metadata::MultipartPart> part_map;
+                       for (const auto& part : listed_parts.value()) {
+                           part_map[part.part_number] = part;
+                       }
+
+                       const auto upload_dir = MultipartUploadDir(storage->temp_path(), upload_id);
+                       const auto final_temp_path =
+                           (upload_dir / ("complete-" + Poco::UUIDGenerator().createOne().toString()))
+                               .string();
+                       std::filesystem::create_directories(upload_dir);
+                       std::ofstream out(final_temp_path, std::ios::binary | std::ios::trunc);
+                       if (!out.is_open()) {
+                           return JsonError(req.version(), "IO_ERROR", "failed to open final temp file",
+                                            ctx.request_id,
+                                            boost::beast::http::status::internal_server_error);
+                       }
+
+                       for (const auto& expected : expected_parts.value()) {
+                           auto it = part_map.find(expected.part_number);
+                           if (it == part_map.end()) {
+                               std::filesystem::remove(final_temp_path);
+                               return JsonError(req.version(), "MISSING_PART",
+                                                "missing uploaded part " +
+                                                    std::to_string(expected.part_number),
+                                                ctx.request_id,
+                                                boost::beast::http::status::conflict);
+                           }
+                           if (it->second.etag != expected.etag) {
+                               std::filesystem::remove(final_temp_path);
+                               return JsonError(req.version(), "ETAG_MISMATCH",
+                                                "part etag mismatch for part " +
+                                                    std::to_string(expected.part_number),
+                                                ctx.request_id,
+                                                boost::beast::http::status::conflict);
+                           }
+
+                           auto locator = DecodePartLocator(it->second.temp_path);
+                           if (!locator.has_value()) {
+                               std::filesystem::remove(final_temp_path);
+                               return JsonError(req.version(), "INVALID_STATE",
+                                                "invalid distributed part locator",
+                                                ctx.request_id,
+                                                boost::beast::http::status::internal_server_error);
+                           }
+                           auto part_body = ReadPartBlob(*locator, service_token);
+                           if (!part_body.ok()) {
+                               std::filesystem::remove(final_temp_path);
+                               return JsonError(req.version(), "IO_ERROR", part_body.error().message,
+                                                ctx.request_id,
+                                                boost::beast::http::status::internal_server_error);
+                           }
+                           out.write(part_body.value().data(),
+                                     static_cast<std::streamsize>(part_body.value().size()));
+                       }
+                       out.flush();
+                       out.close();
+
+                       std::ifstream in(final_temp_path, std::ios::binary);
+                       auto stored = storage->WriteObject(bucket, upload.object_name, in);
+                       std::filesystem::remove(final_temp_path);
+                       if (!stored.ok()) {
+                           return JsonError(req.version(), "IO_ERROR", stored.error().message,
+                                            ctx.request_id,
+                                            boost::beast::http::status::internal_server_error);
+                       }
+
+                       for (const auto& part : listed_parts.value()) {
+                           auto locator = DecodePartLocator(part.temp_path);
+                           if (locator.has_value()) {
+                               BestEffortDeletePartBlob(*locator, service_token);
+                           }
+                       }
+
+                       (void)metadata->UpdateMultipartUploadState(upload_id, "completed");
+                       (void)metadata->DeleteMultipartParts(upload_id);
+                       (void)metadata->DeleteMultipartUpload(upload_id);
+                       std::error_code ec;
+                       std::filesystem::remove_all(upload_dir, ec);
+
+                       return JsonOk(req.version(),
+                                     "{\"name\":\"" + upload.object_name + "\",\"etag\":\"" +
+                                         stored.value().etag + "\",\"size\":" +
+                                         std::to_string(stored.value().size_bytes) + "}");
+                   });
+
+        router.Add("DELETE", "/v1/buckets/{bucket}/multipart-uploads/{upload_id}",
+                   [metadata, storage, service_token = config.distributed.service_auth_token](
+                       const RequestContext& ctx, const HttpRequest& req, const RouteParams& params) {
+                       const auto bucket = params.at("bucket");
+                       const auto upload_id = params.at("upload_id");
+
+                       int bucket_id = 0;
+                       metadata::MultipartUpload upload;
+                       auto validated =
+                           ValidateUploadForBucket(metadata.get(), bucket, upload_id, &bucket_id, &upload);
+                       if (!validated.ok()) {
+                           return JsonError(req.version(), "UPLOAD_NOT_FOUND",
+                                            validated.error().message, ctx.request_id,
+                                            boost::beast::http::status::not_found);
+                       }
+                       if (upload.state == "completed") {
+                           return JsonError(req.version(), "INVALID_STATE",
+                                            "completed upload cannot abort", ctx.request_id,
+                                            boost::beast::http::status::conflict);
+                       }
+
+                       auto parts = metadata->ListMultipartParts(upload_id);
+                       if (parts.ok()) {
+                           for (const auto& part : parts.value()) {
+                               auto locator = DecodePartLocator(part.temp_path);
+                               if (locator.has_value()) {
+                                   BestEffortDeletePartBlob(*locator, service_token);
+                               }
+                           }
+                       }
+
+                       (void)metadata->UpdateMultipartUploadState(upload_id, "aborted");
+                       (void)metadata->DeleteMultipartParts(upload_id);
+                       (void)metadata->DeleteMultipartUpload(upload_id);
+                       std::error_code ec;
+                       std::filesystem::remove_all(MultipartUploadDir(storage->temp_path(), upload_id),
+                                                   ec);
+
+                       HttpResponse response{boost::beast::http::status::no_content, req.version()};
+                       return response;
+                   });
     }
 
     router.Add("DELETE", "/v1/buckets/{bucket}/objects/{object}",
