@@ -1,6 +1,8 @@
 #include "nebulafs/distributed/http_client.h"
 
+#include <cstdint>
 #include <istream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -14,11 +16,10 @@
 
 namespace nebulafs::distributed {
 
-core::Result<HttpCallResult> SendHttpRequest(const std::string& method, const std::string& url,
-                                             const std::string& body,
-                                             const std::string& content_type,
-                                             const std::string& bearer_token,
-                                             const std::map<std::string, std::string>& headers) {
+core::Result<HttpCallResult> SendHttpRequestStream(
+    const std::string& method, const std::string& url, std::istream& body_stream,
+    std::uint64_t content_length, const std::string& content_type,
+    const std::string& bearer_token, const std::map<std::string, std::string>& headers) {
     try {
         Poco::URI uri(url);
         const std::string path_and_query = uri.getPathAndQuery().empty() ? "/" : uri.getPathAndQuery();
@@ -36,10 +37,14 @@ core::Result<HttpCallResult> SendHttpRequest(const std::string& method, const st
         for (const auto& header : headers) {
             request.set(header.first, header.second);
         }
-        request.setContentLength(static_cast<int>(body.size()));
+        if (content_length > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            request.setChunkedTransferEncoding(true);
+        } else {
+            request.setContentLength(static_cast<int>(content_length));
+        }
 
         std::ostream& out = session.sendRequest(request);
-        out << body;
+        out << body_stream.rdbuf();
 
         Poco::Net::HTTPResponse response;
         std::istream& in = session.receiveResponse(response);
@@ -56,6 +61,16 @@ core::Result<HttpCallResult> SendHttpRequest(const std::string& method, const st
     } catch (const Poco::Exception& ex) {
         return core::Error{core::ErrorCode::kIoError, ex.displayText()};
     }
+}
+
+core::Result<HttpCallResult> SendHttpRequest(const std::string& method, const std::string& url,
+                                             const std::string& body,
+                                             const std::string& content_type,
+                                             const std::string& bearer_token,
+                                             const std::map<std::string, std::string>& headers) {
+    std::istringstream in(body);
+    return SendHttpRequestStream(method, url, in, static_cast<std::uint64_t>(body.size()),
+                                 content_type, bearer_token, headers);
 }
 
 }  // namespace nebulafs::distributed
