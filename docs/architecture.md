@@ -54,10 +54,11 @@ Uploads are written to `<base_path>/tmp/<uuid>` then `fsync` + `rename` to final
 
 - Implemented baseline:
   - distributed object CRUD flow (`allocate-write -> storage PUTs -> commit -> resolve-read`)
+  - distributed multipart baseline (create/upload-parts/list/complete/abort via gateway orchestration)
   - replica fallback on read
   - write quorum enforcement
   - distributed integration lane in CI
   - gateway/metadata/storage-node metrics
 - Deferred:
-  - distributed multipart upload APIs
-  - true gateway streaming fan-out writes (current implementation buffers payload during fan-out)
+  - storage-node server-side multipart compose
+  - cross-node multipart cleanup workers beyond request-path best effort
