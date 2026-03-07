@@ -1059,6 +1059,269 @@ TEST(IntegrationHttp, DistributedLargeObjectStreamingWrite) {
     CleanupTempDir(temp_dir);
 }
 
+TEST(IntegrationHttp, DistributedMultipartUploadEndpoints) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto gateway_port = FindFreePort();
+    const auto metadata_port = FindFreePort();
+    const auto storage1_port = FindFreePort();
+    const auto storage2_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage1_port),
+        "http://127.0.0.1:" + std::to_string(storage2_port),
+    };
+    const auto metadata_url = "http://127.0.0.1:" + std::to_string(metadata_port);
+
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage1_config = WriteStorageNodeConfig(temp_dir / "storage1", storage1_port, token);
+    const auto storage2_config = WriteStorageNodeConfig(temp_dir / "storage2", storage2_port, token);
+    const auto gateway_config = WriteGatewayDistributedConfig(temp_dir / "gateway", gateway_port,
+                                                              metadata_url, storage_nodes, token);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage1_args = {"--config", storage1_config.string()};
+    std::vector<std::string> storage2_args = {"--config", storage2_config.string()};
+    std::vector<std::string> gateway_args = {"--config", gateway_config.string(), "--database",
+                                             metadata_db.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage1_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage1_args);
+    auto storage2_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage2_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage1(std::move(storage1_handle));
+        ServerProcess storage2(std::move(storage2_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage1_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage2_port));
+
+        auto gateway_handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, gateway_args);
+        ServerProcess gateway(std::move(gateway_handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", gateway_port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", gateway_port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto initiate = SendRequest(http::verb::post, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/multipart-uploads",
+                                    R"({"object":"movie.bin"})", "application/json");
+        ASSERT_EQ(initiate.result(), http::status::ok);
+        Poco::JSON::Parser parser;
+        auto initiate_json = parser.parse(initiate.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto upload_id = initiate_json->getValue<std::string>("upload_id");
+        ASSERT_FALSE(upload_id.empty());
+
+        auto part1 = SendRequest(
+            http::verb::put, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/1", "hello-", "");
+        ASSERT_EQ(part1.result(), http::status::ok);
+        auto part1_json = parser.parse(part1.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto part1_etag = part1_json->getValue<std::string>("etag");
+
+        auto part2 = SendRequest(
+            http::verb::put, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/2", "world", "");
+        ASSERT_EQ(part2.result(), http::status::ok);
+        auto part2_json = parser.parse(part2.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto part2_etag = part2_json->getValue<std::string>("etag");
+
+        auto parts = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                 "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts", "",
+                                 "");
+        ASSERT_EQ(parts.result(), http::status::ok);
+        auto parts_json = parser.parse(parts.body()).extract<Poco::JSON::Object::Ptr>();
+        auto parts_arr = parts_json->getArray("parts");
+        ASSERT_TRUE(parts_arr);
+        ASSERT_EQ(parts_arr->size(), 2);
+
+        const std::string complete_body = std::string("{\"parts\":[") +
+                                          "{\"part_number\":1,\"etag\":\"" + part1_etag + "\"}," +
+                                          "{\"part_number\":2,\"etag\":\"" + part2_etag + "\"}" +
+                                          "]}";
+        auto complete = SendRequest(
+            http::verb::post, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/complete", complete_body,
+            "application/json");
+        ASSERT_EQ(complete.result(), http::status::ok);
+
+        auto download = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/objects/movie.bin", "", "");
+        EXPECT_EQ(download.result(), http::status::ok);
+        EXPECT_EQ(download.body(), "hello-world");
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, DistributedMultipartAbortEndpoint) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto gateway_port = FindFreePort();
+    const auto metadata_port = FindFreePort();
+    const auto storage1_port = FindFreePort();
+    const auto storage2_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage1_port),
+        "http://127.0.0.1:" + std::to_string(storage2_port),
+    };
+    const auto metadata_url = "http://127.0.0.1:" + std::to_string(metadata_port);
+
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage1_config = WriteStorageNodeConfig(temp_dir / "storage1", storage1_port, token);
+    const auto storage2_config = WriteStorageNodeConfig(temp_dir / "storage2", storage2_port, token);
+    const auto gateway_config = WriteGatewayDistributedConfig(temp_dir / "gateway", gateway_port,
+                                                              metadata_url, storage_nodes, token);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage1_args = {"--config", storage1_config.string()};
+    std::vector<std::string> storage2_args = {"--config", storage2_config.string()};
+    std::vector<std::string> gateway_args = {"--config", gateway_config.string(), "--database",
+                                             metadata_db.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage1_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage1_args);
+    auto storage2_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage2_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage1(std::move(storage1_handle));
+        ServerProcess storage2(std::move(storage2_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage1_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage2_port));
+
+        auto gateway_handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, gateway_args);
+        ServerProcess gateway(std::move(gateway_handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", gateway_port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", gateway_port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto initiate = SendRequest(http::verb::post, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/multipart-uploads",
+                                    R"({"object":"cancel.bin"})", "application/json");
+        ASSERT_EQ(initiate.result(), http::status::ok);
+        Poco::JSON::Parser parser;
+        auto initiate_json = parser.parse(initiate.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto upload_id = initiate_json->getValue<std::string>("upload_id");
+
+        auto part1 = SendRequest(
+            http::verb::put, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/1", "temp-data", "");
+        ASSERT_EQ(part1.result(), http::status::ok);
+
+        auto abort = SendRequest(http::verb::delete_, "127.0.0.1", gateway_port,
+                                 "/v1/buckets/demo/multipart-uploads/" + upload_id, "", "");
+        EXPECT_EQ(abort.result(), http::status::no_content);
+
+        auto parts_after_abort =
+            SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                        "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts", "", "");
+        EXPECT_EQ(parts_after_abort.result(), http::status::not_found);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, DistributedMultipartRejectsEtagMismatchOnComplete) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto gateway_port = FindFreePort();
+    const auto metadata_port = FindFreePort();
+    const auto storage1_port = FindFreePort();
+    const auto storage2_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage1_port),
+        "http://127.0.0.1:" + std::to_string(storage2_port),
+    };
+    const auto metadata_url = "http://127.0.0.1:" + std::to_string(metadata_port);
+
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage1_config = WriteStorageNodeConfig(temp_dir / "storage1", storage1_port, token);
+    const auto storage2_config = WriteStorageNodeConfig(temp_dir / "storage2", storage2_port, token);
+    const auto gateway_config = WriteGatewayDistributedConfig(temp_dir / "gateway", gateway_port,
+                                                              metadata_url, storage_nodes, token);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage1_args = {"--config", storage1_config.string()};
+    std::vector<std::string> storage2_args = {"--config", storage2_config.string()};
+    std::vector<std::string> gateway_args = {"--config", gateway_config.string(), "--database",
+                                             metadata_db.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage1_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage1_args);
+    auto storage2_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage2_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage1(std::move(storage1_handle));
+        ServerProcess storage2(std::move(storage2_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage1_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage2_port));
+
+        auto gateway_handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, gateway_args);
+        ServerProcess gateway(std::move(gateway_handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", gateway_port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", gateway_port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto initiate = SendRequest(http::verb::post, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/multipart-uploads",
+                                    R"({"object":"broken.bin"})", "application/json");
+        ASSERT_EQ(initiate.result(), http::status::ok);
+        Poco::JSON::Parser parser;
+        auto initiate_json = parser.parse(initiate.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto upload_id = initiate_json->getValue<std::string>("upload_id");
+
+        auto part1 = SendRequest(
+            http::verb::put, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/1", "temp-data", "");
+        ASSERT_EQ(part1.result(), http::status::ok);
+
+        auto complete = SendRequest(
+            http::verb::post, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/complete",
+            R"({"parts":[{"part_number":1,"etag":"wrong-etag"}]})", "application/json");
+        EXPECT_EQ(complete.result(), http::status::conflict);
+
+        auto download = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/objects/broken.bin", "", "");
+        EXPECT_EQ(download.result(), http::status::not_found);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
 TEST(IntegrationHttp, DistributedReadFallbackWhenPrimaryDown) {
     const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
     if (!enabled || std::string(enabled) != "1") {

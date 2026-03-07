@@ -132,7 +132,7 @@ curl http://localhost:8080/v1/buckets/demo/objects/readme.txt -o readme.txt
 curl "http://localhost:8080/v1/buckets/demo/objects?prefix=read"
 ```
 
-Note: multipart upload endpoints are currently single-node only. Distributed mode in Milestone 6 focuses on object CRUD baseline, and gateway upload fan-out is currently buffered in memory (not true streaming fan-out yet).
+Note: multipart upload endpoints are available in both single-node and distributed mode. In distributed mode, parts are stored on storage nodes and finalized through gateway orchestration.
 
 ### Authentication test (Keycloak local)
 
@@ -204,13 +204,14 @@ Troubleshooting:
 - **Milestone 4**: Multipart uploads and cleanup baseline (completed).
 - **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts (completed).
 - **Milestone 6**: Distributed baseline implemented (gateway + metadata service + storage nodes + distributed CI lane).
+- **Milestone 7**: Distributed upload maturity (streamed writes + distributed multipart baseline) (in progress).
 
 ### Milestone 6 completion criteria
 - Distributed mode keeps public object CRUD routes unchanged at the gateway.
 - Metadata and storage-node internal services run as separate binaries with service-token checks.
 - Distributed failure correctness is covered in integration tests (read fallback, write quorum failure, token rejection).
 - Distributed metrics are exposed and validated for gateway, metadata service, and storage node.
-- Deferred to next milestone: distributed multipart APIs and true streaming write fan-out.
+- Current limitation: distributed multipart `complete` is gateway-orchestrated (part fetch + assemble + final write), without storage-node server-side compose.
 
 ## Docs
 - Architecture: `docs/architecture.md`
