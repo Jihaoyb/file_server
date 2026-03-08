@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
@@ -29,6 +30,7 @@
 #include "nebulafs/core/ids.h"
 #include "nebulafs/core/logger.h"
 #include "nebulafs/core/time.h"
+#include "nebulafs/distributed/http_client.h"
 #include "nebulafs/observability/metrics.h"
 #include "nebulafs/auth/jwt_utils.h"
 #include "nebulafs/auth/jwt_verifier.h"
@@ -121,6 +123,39 @@ std::string GetQueryParam(const std::string& target, const std::string& key) {
         }
     }
     return "";
+}
+
+std::string BlobUrl(const std::string& endpoint, const std::string& blob_id) {
+    if (!endpoint.empty() && endpoint.back() == '/') {
+        return endpoint.substr(0, endpoint.size() - 1) + "/internal/v1/blobs/" + blob_id;
+    }
+    return endpoint + "/internal/v1/blobs/" + blob_id;
+}
+
+struct DistributedPartLocator {
+    std::string blob_id;
+    std::vector<std::string> endpoints;
+};
+
+std::optional<DistributedPartLocator> DecodePartLocator(const std::string& encoded) {
+    const auto sep = encoded.find('|');
+    if (sep == std::string::npos) {
+        return std::nullopt;
+    }
+
+    DistributedPartLocator locator;
+    locator.blob_id = encoded.substr(0, sep);
+    std::stringstream ss(encoded.substr(sep + 1));
+    std::string endpoint;
+    while (std::getline(ss, endpoint, ',')) {
+        if (!endpoint.empty()) {
+            locator.endpoints.push_back(endpoint);
+        }
+    }
+    if (locator.blob_id.empty() || locator.endpoints.empty()) {
+        return std::nullopt;
+    }
+    return locator;
 }
 
 std::optional<RangeRequest> ParseRange(const std::string& header, std::uint64_t size) {
@@ -842,7 +877,7 @@ void HttpServer::Run() {
 }
 
 void HttpServer::StartCleanupJob() {
-    if (!config_.cleanup.enabled || config_.server.mode == "distributed") {
+    if (!config_.cleanup.enabled) {
         return;
     }
     cleanup_timer_ = std::make_unique<net::steady_timer>(ioc_);
@@ -876,14 +911,76 @@ void HttpServer::RunCleanupSweep() {
     }
 
     for (const auto& upload : expired.value()) {
-        (void)metadata_->UpdateMultipartUploadState(upload.upload_id, "expired");
-        (void)metadata_->DeleteMultipartParts(upload.upload_id);
-        (void)metadata_->DeleteMultipartUpload(upload.upload_id);
+        bool upload_success = true;
+        if (config_.server.mode == "distributed") {
+            auto parts = metadata_->ListMultipartParts(upload.upload_id);
+            if (!parts.ok()) {
+                upload_success = false;
+                nebulafs::core::LogError("Cleanup sweep failed to list upload parts for " +
+                                         upload.upload_id + ": " + parts.error().message);
+            } else {
+                for (const auto& part : parts.value()) {
+                    // Distributed multipart parts encode blob id + replica endpoints in temp_path.
+                    auto locator = DecodePartLocator(part.temp_path);
+                    if (!locator.has_value()) {
+                        upload_success = false;
+                        nebulafs::core::LogError(
+                            "Cleanup sweep found invalid distributed part locator for upload " +
+                            upload.upload_id + ", part " + std::to_string(part.part_number));
+                        continue;
+                    }
+                    for (const auto& endpoint : locator->endpoints) {
+                        auto del = distributed::SendHttpRequest(
+                            "DELETE", BlobUrl(endpoint, locator->blob_id), "", "",
+                            config_.distributed.service_auth_token, {});
+                        const bool success =
+                            del.ok() && (del.value().status == 200 || del.value().status == 404);
+                        observability::RecordGatewayDistributedCleanupBlobDelete(success);
+                        if (!success) {
+                            upload_success = false;
+                            if (!del.ok()) {
+                                nebulafs::core::LogError(
+                                    "Cleanup sweep failed to delete blob replica for upload " +
+                                    upload.upload_id + ": " + del.error().message);
+                            } else {
+                                nebulafs::core::LogError(
+                                    "Cleanup sweep delete returned status " +
+                                    std::to_string(del.value().status) + " for upload " +
+                                    upload.upload_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        auto mark_expired = metadata_->UpdateMultipartUploadState(upload.upload_id, "expired");
+        if (!mark_expired.ok()) {
+            upload_success = false;
+            nebulafs::core::LogError("Cleanup sweep failed to mark upload expired for " +
+                                     upload.upload_id + ": " + mark_expired.error().message);
+        }
+        auto delete_parts = metadata_->DeleteMultipartParts(upload.upload_id);
+        if (!delete_parts.ok()) {
+            upload_success = false;
+            nebulafs::core::LogError("Cleanup sweep failed to delete multipart parts for " +
+                                     upload.upload_id + ": " + delete_parts.error().message);
+        }
+        auto delete_upload = metadata_->DeleteMultipartUpload(upload.upload_id);
+        if (!delete_upload.ok()) {
+            upload_success = false;
+            nebulafs::core::LogError("Cleanup sweep failed to delete multipart upload " +
+                                     upload.upload_id + ": " + delete_upload.error().message);
+        }
 
         std::error_code ec;
         const auto path = std::filesystem::path(storage_->temp_path()) / "multipart" /
                           upload.upload_id;
         std::filesystem::remove_all(path, ec);
+
+        if (config_.server.mode == "distributed") {
+            observability::RecordGatewayDistributedCleanupUpload(upload_success);
+        }
     }
 }
 

@@ -10,7 +10,7 @@ NebulaFS is a production-grade, cloud-storage style file server written in C++20
 - **Structured logging** via Poco with request correlation.
 - **Security-first** design with OIDC/JWT auth and JWKS validation support.
 
-## Architecture (Milestone 0–6 baseline)
+## Architecture (Milestone 0–7 baseline)
 
 ```mermaid
 flowchart LR
@@ -59,6 +59,13 @@ Distributed mode now emits service-specific counters and latency sums via `/metr
   - `nebulafs_gateway_storage_put_failures_total`
   - `nebulafs_gateway_metadata_rpc_failures_total`
   - `nebulafs_gateway_replica_fallback_total`
+  - `nebulafs_gateway_multipart_compose_failures_total`
+  - `nebulafs_gateway_multipart_rollback_attempts_total`
+  - `nebulafs_gateway_multipart_rollback_failures_total`
+  - `nebulafs_gateway_distributed_cleanup_uploads_total`
+  - `nebulafs_gateway_distributed_cleanup_upload_failures_total`
+  - `nebulafs_gateway_distributed_cleanup_blob_deletes_total`
+  - `nebulafs_gateway_distributed_cleanup_blob_delete_failures_total`
 - Metadata service:
   - `nebulafs_metadata_allocate_requests_total`
   - `nebulafs_metadata_allocate_failures_total`
@@ -76,6 +83,9 @@ Distributed mode now emits service-specific counters and latency sums via `/metr
   - `nebulafs_storage_node_blob_deletes_total`
   - `nebulafs_storage_node_blob_delete_failures_total`
   - `nebulafs_storage_node_blob_delete_latency_ms_sum`
+  - `nebulafs_storage_node_blob_composes_total`
+  - `nebulafs_storage_node_blob_compose_failures_total`
+  - `nebulafs_storage_node_blob_compose_latency_ms_sum`
 
 ### Traffic controls
 `config/server.json` supports:
@@ -204,14 +214,15 @@ Troubleshooting:
 - **Milestone 4**: Multipart uploads and cleanup baseline (completed).
 - **Milestone 5**: Metrics (Prometheus), rate limiting, timeouts (completed).
 - **Milestone 6**: Distributed baseline implemented (gateway + metadata service + storage nodes + distributed CI lane).
-- **Milestone 7**: Distributed upload maturity (streamed writes + distributed multipart baseline) (in progress).
+- **Milestone 7**: Distributed upload maturity (streamed writes + distributed multipart baseline) (completed).
+- **Milestone 8**: Distributed reliability hardening (compose reliability + distributed cleanup) (in progress).
 
 ### Milestone 6 completion criteria
 - Distributed mode keeps public object CRUD routes unchanged at the gateway.
 - Metadata and storage-node internal services run as separate binaries with service-token checks.
 - Distributed failure correctness is covered in integration tests (read fallback, write quorum failure, token rejection).
 - Distributed metrics are exposed and validated for gateway, metadata service, and storage node.
-- Current limitation: distributed multipart `complete` is gateway-orchestrated (part fetch + assemble + final write), without storage-node server-side compose.
+- Current limitation: distributed cleanup coordination is best-effort per gateway instance (no cluster leader election).
 
 ## Docs
 - Architecture: `docs/architecture.md`
