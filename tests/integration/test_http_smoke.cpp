@@ -199,6 +199,11 @@ std::string ToJsonArray(const std::vector<std::string>& values) {
 struct DistributedGatewayConfigOptions {
     int replication_factor{2};
     int min_write_acks{2};
+    bool cleanup_enabled{false};
+    int cleanup_sweep_interval_seconds{300};
+    int cleanup_grace_period_seconds{60};
+    int cleanup_max_uploads_per_sweep{200};
+    int multipart_max_upload_ttl_seconds{3600};
 };
 
 std::filesystem::path WriteGatewayDistributedConfig(const std::filesystem::path& dir,
@@ -230,10 +235,15 @@ std::filesystem::path WriteGatewayDistributedConfig(const std::filesystem::path&
         << "  },\n"
         << "  \"storage\": {\n"
         << "    \"base_path\": \"" << storage_dir.generic_string() << "\",\n"
-        << "    \"temp_path\": \"" << temp_dir.generic_string() << "\"\n"
+        << "    \"temp_path\": \"" << temp_dir.generic_string() << "\",\n"
+        << "    \"multipart\": {\n"
+        << "      \"max_upload_ttl_seconds\": " << options.multipart_max_upload_ttl_seconds << "\n"
+        << "    }\n"
         << "  },\n"
-        << "  \"cleanup\": {\"enabled\": false, \"sweep_interval_seconds\": 300, "
-           "\"grace_period_seconds\": 60, \"max_uploads_per_sweep\": 200},\n"
+        << "  \"cleanup\": {\"enabled\": " << (options.cleanup_enabled ? "true" : "false")
+        << ", \"sweep_interval_seconds\": " << options.cleanup_sweep_interval_seconds
+        << ", \"grace_period_seconds\": " << options.cleanup_grace_period_seconds
+        << ", \"max_uploads_per_sweep\": " << options.cleanup_max_uploads_per_sweep << "},\n"
         << "  \"observability\": {\"log_level\": \"warning\"},\n"
         << "  \"auth\": {\"enabled\": false, \"issuer\": \"\", \"audience\": \"\", "
            "\"jwks_url\": \"\", \"cache_ttl_seconds\": 300, \"clock_skew_seconds\": 60, "
@@ -1144,6 +1154,13 @@ TEST(IntegrationHttp, DistributedMultipartUploadEndpoints) {
         ASSERT_TRUE(parts_arr);
         ASSERT_EQ(parts_arr->size(), 2);
 
+        auto storage_metrics_before =
+            SendRequest(http::verb::get, "127.0.0.1", storage1_port, "/metrics", "", "");
+        ASSERT_EQ(storage_metrics_before.result(), http::status::ok);
+        const auto compose_before = ParseMetricCounter(
+            storage_metrics_before.body(), "nebulafs_storage_node_blob_composes_total");
+        ASSERT_TRUE(compose_before.has_value());
+
         const std::string complete_body = std::string("{\"parts\":[") +
                                           "{\"part_number\":1,\"etag\":\"" + part1_etag + "\"}," +
                                           "{\"part_number\":2,\"etag\":\"" + part2_etag + "\"}" +
@@ -1153,6 +1170,17 @@ TEST(IntegrationHttp, DistributedMultipartUploadEndpoints) {
             "/v1/buckets/demo/multipart-uploads/" + upload_id + "/complete", complete_body,
             "application/json");
         ASSERT_EQ(complete.result(), http::status::ok);
+        auto complete_json = parser.parse(complete.body()).extract<Poco::JSON::Object::Ptr>();
+        EXPECT_FALSE(complete_json->getValue<std::string>("etag").empty());
+        EXPECT_GT(complete_json->getValue<Poco::UInt64>("size"), 0);
+
+        auto storage_metrics_after =
+            SendRequest(http::verb::get, "127.0.0.1", storage1_port, "/metrics", "", "");
+        ASSERT_EQ(storage_metrics_after.result(), http::status::ok);
+        const auto compose_after = ParseMetricCounter(storage_metrics_after.body(),
+                                                      "nebulafs_storage_node_blob_composes_total");
+        ASSERT_TRUE(compose_after.has_value());
+        EXPECT_GT(*compose_after, *compose_before);
 
         auto download = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
                                     "/v1/buckets/demo/objects/movie.bin", "", "");
@@ -1317,6 +1345,129 @@ TEST(IntegrationHttp, DistributedMultipartRejectsEtagMismatchOnComplete) {
         auto download = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
                                     "/v1/buckets/demo/objects/broken.bin", "", "");
         EXPECT_EQ(download.result(), http::status::not_found);
+    }
+
+    CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, DistributedMultipartComposeQuorumFailureKeepsObjectInvisible) {
+    const char* enabled = std::getenv("NEBULAFS_ENABLE_DISTRIBUTED_IT");
+    if (!enabled || std::string(enabled) != "1") {
+        GTEST_SKIP() << "distributed integration lane is disabled";
+    }
+
+    const auto gateway_port = FindFreePort();
+    const auto metadata_port = FindFreePort();
+    const auto storage1_port = FindFreePort();
+    const auto storage2_port = FindFreePort();
+    const auto temp_dir = MakeTempDir();
+    const std::string token = "distributed-test-token";
+    const std::vector<std::string> storage_nodes = {
+        "http://127.0.0.1:" + std::to_string(storage1_port),
+        "http://127.0.0.1:" + std::to_string(storage2_port),
+    };
+    const auto metadata_url = "http://127.0.0.1:" + std::to_string(metadata_port);
+
+    DistributedGatewayConfigOptions options;
+    options.replication_factor = 2;
+    options.min_write_acks = 2;
+    const auto metadata_config =
+        WriteMetadataServiceConfig(temp_dir / "metadata", metadata_port, token, storage_nodes);
+    const auto metadata_db = WriteDatabaseConfig(temp_dir / "metadata");
+    const auto storage1_config = WriteStorageNodeConfig(temp_dir / "storage1", storage1_port, token);
+    const auto storage2_config = WriteStorageNodeConfig(temp_dir / "storage2", storage2_port, token);
+    const auto gateway_config = WriteGatewayDistributedConfig(
+        temp_dir / "gateway", gateway_port, metadata_url, storage_nodes, token, options);
+
+    std::vector<std::string> metadata_args = {"--config", metadata_config.string(), "--database",
+                                              metadata_db.string()};
+    std::vector<std::string> storage1_args = {"--config", storage1_config.string()};
+    std::vector<std::string> storage2_args = {"--config", storage2_config.string()};
+    std::vector<std::string> gateway_args = {"--config", gateway_config.string(), "--database",
+                                             metadata_db.string()};
+
+    auto metadata_handle = Poco::Process::launch(NEBULAFS_METADATA_PATH, metadata_args);
+    auto storage1_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage1_args);
+    auto storage2_handle = Poco::Process::launch(NEBULAFS_STORAGE_NODE_PATH, storage2_args);
+    {
+        ServerProcess metadata(std::move(metadata_handle));
+        ServerProcess storage1(std::move(storage1_handle));
+        ServerProcess storage2(std::move(storage2_handle));
+
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", metadata_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage1_port));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", storage2_port));
+
+        auto gateway_handle = Poco::Process::launch(NEBULAFS_SERVER_PATH, gateway_args);
+        ServerProcess gateway(std::move(gateway_handle));
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", gateway_port));
+
+        auto create_bucket = SendRequest(http::verb::post, "127.0.0.1", gateway_port, "/v1/buckets",
+                                         R"({"name":"demo"})", "application/json");
+        ASSERT_EQ(create_bucket.result(), http::status::ok);
+
+        auto initiate = SendRequest(http::verb::post, "127.0.0.1", gateway_port,
+                                    "/v1/buckets/demo/multipart-uploads",
+                                    R"({"object":"quorum.bin"})", "application/json");
+        ASSERT_EQ(initiate.result(), http::status::ok);
+        Poco::JSON::Parser parser;
+        auto initiate_json = parser.parse(initiate.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto upload_id = initiate_json->getValue<std::string>("upload_id");
+
+        auto part1 = SendRequest(
+            http::verb::put, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/1", "hello-", "");
+        ASSERT_EQ(part1.result(), http::status::ok);
+        auto part2 = SendRequest(
+            http::verb::put, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/parts/2", "world", "");
+        ASSERT_EQ(part2.result(), http::status::ok);
+
+        auto part1_json = parser.parse(part1.body()).extract<Poco::JSON::Object::Ptr>();
+        auto part2_json = parser.parse(part2.body()).extract<Poco::JSON::Object::Ptr>();
+        const auto part1_etag = part1_json->getValue<std::string>("etag");
+        const auto part2_etag = part2_json->getValue<std::string>("etag");
+
+        auto metrics_before = SendRequest(http::verb::get, "127.0.0.1", gateway_port, "/metrics",
+                                          "", "");
+        ASSERT_EQ(metrics_before.result(), http::status::ok);
+        const auto compose_failures_before = ParseMetricCounter(
+            metrics_before.body(), "nebulafs_gateway_multipart_compose_failures_total");
+        const auto rollback_attempts_before = ParseMetricCounter(
+            metrics_before.body(), "nebulafs_gateway_multipart_rollback_attempts_total");
+        ASSERT_TRUE(compose_failures_before.has_value());
+        ASSERT_TRUE(rollback_attempts_before.has_value());
+
+        storage2.Stop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        const std::string complete_body = std::string("{\"parts\":[") +
+                                          "{\"part_number\":1,\"etag\":\"" + part1_etag + "\"}," +
+                                          "{\"part_number\":2,\"etag\":\"" + part2_etag + "\"}" +
+                                          "]}";
+        auto complete = SendRequest(
+            http::verb::post, "127.0.0.1", gateway_port,
+            "/v1/buckets/demo/multipart-uploads/" + upload_id + "/complete", complete_body,
+            "application/json");
+        ASSERT_EQ(complete.result(), http::status::internal_server_error);
+        EXPECT_NE(complete.body().find("insufficient storage node compose acknowledgements"),
+                  std::string::npos);
+
+        auto missing = SendRequest(http::verb::get, "127.0.0.1", gateway_port,
+                                   "/v1/buckets/demo/objects/quorum.bin", "", "");
+        EXPECT_EQ(missing.result(), http::status::not_found);
+
+        auto metrics_after = SendRequest(http::verb::get, "127.0.0.1", gateway_port, "/metrics",
+                                         "", "");
+        ASSERT_EQ(metrics_after.result(), http::status::ok);
+        const auto compose_failures_after = ParseMetricCounter(
+            metrics_after.body(), "nebulafs_gateway_multipart_compose_failures_total");
+        const auto rollback_attempts_after = ParseMetricCounter(
+            metrics_after.body(), "nebulafs_gateway_multipart_rollback_attempts_total");
+        ASSERT_TRUE(compose_failures_after.has_value());
+        ASSERT_TRUE(rollback_attempts_after.has_value());
+        EXPECT_GT(*compose_failures_after, *compose_failures_before);
+        EXPECT_GT(*rollback_attempts_after, *rollback_attempts_before);
     }
 
     CleanupTempDir(temp_dir);
@@ -1547,8 +1698,11 @@ TEST(IntegrationHttp, DistributedInternalEndpointsRejectInvalidServiceToken) {
             storage_metrics_before.body(), "nebulafs_storage_node_blob_read_failures_total");
         auto storage_write_failures_before = ParseMetricCounter(
             storage_metrics_before.body(), "nebulafs_storage_node_blob_write_failures_total");
+        auto storage_compose_failures_before = ParseMetricCounter(
+            storage_metrics_before.body(), "nebulafs_storage_node_blob_compose_failures_total");
         ASSERT_TRUE(storage_read_failures_before.has_value());
         ASSERT_TRUE(storage_write_failures_before.has_value());
+        ASSERT_TRUE(storage_compose_failures_before.has_value());
 
         auto metadata_no_token = SendRequest(http::verb::get, "127.0.0.1", metadata_port,
                                              "/internal/v1/buckets/list", "", "");
@@ -1596,6 +1750,19 @@ TEST(IntegrationHttp, DistributedInternalEndpointsRejectInvalidServiceToken) {
         EXPECT_EQ(storage_missing_placement.result(), http::status::unauthorized);
         ExpectErrorEnvelope(storage_missing_placement, "UNAUTHORIZED");
 
+        auto storage_compose_no_token = SendRequest(
+            http::verb::post, "127.0.0.1", storage_port, "/internal/v1/blobs/composed/compose",
+            R"({"source_blob_ids":["part-1"]})", "application/json");
+        EXPECT_EQ(storage_compose_no_token.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(storage_compose_no_token, "UNAUTHORIZED");
+
+        auto storage_compose_missing_placement = SendRequest(
+            http::verb::post, "127.0.0.1", storage_port, "/internal/v1/blobs/composed/compose",
+            R"({"source_blob_ids":["part-1"]})", "application/json",
+            {{"Authorization", "Bearer " + token}});
+        EXPECT_EQ(storage_compose_missing_placement.result(), http::status::unauthorized);
+        ExpectErrorEnvelope(storage_compose_missing_placement, "UNAUTHORIZED");
+
         auto metadata_metrics_after =
             SendRequest(http::verb::get, "127.0.0.1", metadata_port, "/metrics", "", "");
         ASSERT_EQ(metadata_metrics_after.result(), http::status::ok);
@@ -1611,10 +1778,14 @@ TEST(IntegrationHttp, DistributedInternalEndpointsRejectInvalidServiceToken) {
             storage_metrics_after.body(), "nebulafs_storage_node_blob_read_failures_total");
         auto storage_write_failures_after = ParseMetricCounter(
             storage_metrics_after.body(), "nebulafs_storage_node_blob_write_failures_total");
+        auto storage_compose_failures_after = ParseMetricCounter(
+            storage_metrics_after.body(), "nebulafs_storage_node_blob_compose_failures_total");
         ASSERT_TRUE(storage_read_failures_after.has_value());
         ASSERT_TRUE(storage_write_failures_after.has_value());
+        ASSERT_TRUE(storage_compose_failures_after.has_value());
         EXPECT_GT(*storage_read_failures_after, *storage_read_failures_before);
         EXPECT_GT(*storage_write_failures_after, *storage_write_failures_before);
+        EXPECT_GT(*storage_compose_failures_after, *storage_compose_failures_before);
     }
 
     CleanupTempDir(temp_dir);

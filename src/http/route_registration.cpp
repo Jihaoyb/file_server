@@ -1,13 +1,15 @@
 #include "nebulafs/http/route_registration.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 #include <string>
-#include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 #include <Poco/DigestEngine.h>
 #include <Poco/JSON/Array.h>
@@ -68,6 +70,10 @@ std::string BlobUrl(const std::string& endpoint, const std::string& blob_id) {
     return endpoint + "/internal/v1/blobs/" + blob_id;
 }
 
+std::string BlobComposeUrl(const std::string& endpoint, const std::string& blob_id) {
+    return BlobUrl(endpoint, blob_id) + "/compose";
+}
+
 struct DistributedPartLocator {
     std::string blob_id;
     std::vector<std::string> endpoints;
@@ -112,16 +118,64 @@ void BestEffortDeletePartBlob(const DistributedPartLocator& locator, const std::
     }
 }
 
-core::Result<std::string> ReadPartBlob(const DistributedPartLocator& locator,
-                                       const std::string& token) {
-    for (const auto& endpoint : locator.endpoints) {
-        auto get =
-            distributed::SendHttpRequest("GET", BlobUrl(endpoint, locator.blob_id), "", "", token, {});
-        if (get.ok() && get.value().status == 200) {
-            return get.value().body;
+void BestEffortDeleteBlobReplicas(const std::string& blob_id,
+                                  const std::vector<metadata::ReplicaTarget>& replicas,
+                                  const std::string& token) {
+    observability::RecordGatewayMultipartRollbackAttempt();
+    for (const auto& replica : replicas) {
+        auto del = distributed::SendHttpRequest("DELETE", BlobUrl(replica.endpoint, blob_id), "", "",
+                                                token, {});
+        if (!del.ok() || (del.value().status != 200 && del.value().status != 404)) {
+            observability::RecordGatewayMultipartRollbackFailure();
         }
     }
-    return core::Error{core::ErrorCode::kIoError, "failed to fetch multipart part blob"};
+}
+
+struct ComposeBlobResult {
+    std::uint64_t size_bytes{0};
+    std::string etag;
+};
+
+core::Result<ComposeBlobResult> ComposeBlobOnNode(const std::string& endpoint,
+                                                  const std::string& target_blob_id,
+                                                  const std::vector<std::string>& source_blob_ids,
+                                                  const std::string& service_token,
+                                                  const std::string& placement_token) {
+    Poco::JSON::Array::Ptr source_array = new Poco::JSON::Array();
+    for (const auto& source_blob_id : source_blob_ids) {
+        source_array->add(source_blob_id);
+    }
+    Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+    root->set("source_blob_ids", source_array);
+    std::ostringstream body;
+    root->stringify(body);
+
+    auto compose =
+        distributed::SendHttpRequest("POST", BlobComposeUrl(endpoint, target_blob_id), body.str(),
+                                     "application/json", service_token,
+                                     {{"X-Placement-Token", placement_token}});
+    if (!compose.ok()) {
+        return compose.error();
+    }
+    if (compose.value().status != 200) {
+        return core::Error{core::ErrorCode::kIoError, "compose failed with status " +
+                                                         std::to_string(compose.value().status)};
+    }
+
+    try {
+        Poco::JSON::Parser parser;
+        auto parsed = parser.parse(compose.value().body).extract<Poco::JSON::Object::Ptr>();
+        ComposeBlobResult result;
+        result.size_bytes = parsed->getValue<Poco::UInt64>("size_bytes");
+        result.etag = parsed->getValue<std::string>("etag");
+        if (result.etag.empty()) {
+            return core::Error{core::ErrorCode::kIoError, "compose response missing etag"};
+        }
+        return result;
+    } catch (const std::exception& ex) {
+        return core::Error{core::ErrorCode::kIoError,
+                           "invalid compose response: " + std::string(ex.what())};
+    }
 }
 
 std::string MultipartPartPath(const std::string& temp_root, const std::string& upload_id,
@@ -814,7 +868,9 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataBac
                    });
 
         router.Add("POST", "/v1/buckets/{bucket}/multipart-uploads/{upload_id}/complete",
-                   [metadata, storage, service_token = config.distributed.service_auth_token](
+                   [metadata, storage, service_token = config.distributed.service_auth_token,
+                    replication_factor = config.distributed.replication_factor,
+                    min_write_acks = config.distributed.min_write_acks](
                        const RequestContext& ctx, const HttpRequest& req, const RouteParams& params) {
                        const auto bucket = params.at("bucket");
                        const auto upload_id = params.at("upload_id");
@@ -857,22 +913,14 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataBac
                            part_map[part.part_number] = part;
                        }
 
-                       const auto upload_dir = MultipartUploadDir(storage->temp_path(), upload_id);
-                       const auto final_temp_path =
-                           (upload_dir / ("complete-" + Poco::UUIDGenerator().createOne().toString()))
-                               .string();
-                       std::filesystem::create_directories(upload_dir);
-                       std::ofstream out(final_temp_path, std::ios::binary | std::ios::trunc);
-                       if (!out.is_open()) {
-                           return JsonError(req.version(), "IO_ERROR", "failed to open final temp file",
-                                            ctx.request_id,
-                                            boost::beast::http::status::internal_server_error);
-                       }
+                       std::vector<DistributedPartLocator> ordered_locators;
+                       ordered_locators.reserve(expected_parts.value().size());
+                       std::vector<std::string> ordered_source_blob_ids;
+                       ordered_source_blob_ids.reserve(expected_parts.value().size());
 
                        for (const auto& expected : expected_parts.value()) {
                            auto it = part_map.find(expected.part_number);
                            if (it == part_map.end()) {
-                               std::filesystem::remove(final_temp_path);
                                return JsonError(req.version(), "MISSING_PART",
                                                 "missing uploaded part " +
                                                     std::to_string(expected.part_number),
@@ -880,7 +928,6 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataBac
                                                 boost::beast::http::status::conflict);
                            }
                            if (it->second.etag != expected.etag) {
-                               std::filesystem::remove(final_temp_path);
                                return JsonError(req.version(), "ETAG_MISMATCH",
                                                 "part etag mismatch for part " +
                                                     std::to_string(expected.part_number),
@@ -890,30 +937,85 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataBac
 
                            auto locator = DecodePartLocator(it->second.temp_path);
                            if (!locator.has_value()) {
-                               std::filesystem::remove(final_temp_path);
                                return JsonError(req.version(), "INVALID_STATE",
                                                 "invalid distributed part locator",
                                                 ctx.request_id,
                                                 boost::beast::http::status::internal_server_error);
                            }
-                           auto part_body = ReadPartBlob(*locator, service_token);
-                           if (!part_body.ok()) {
-                               std::filesystem::remove(final_temp_path);
-                               return JsonError(req.version(), "IO_ERROR", part_body.error().message,
-                                                ctx.request_id,
-                                                boost::beast::http::status::internal_server_error);
-                           }
-                           out.write(part_body.value().data(),
-                                     static_cast<std::streamsize>(part_body.value().size()));
+                           ordered_source_blob_ids.push_back(locator->blob_id);
+                           ordered_locators.push_back(*locator);
                        }
-                       out.flush();
-                       out.close();
 
-                       std::ifstream in(final_temp_path, std::ios::binary);
-                       auto stored = storage->WriteObject(bucket, upload.object_name, in);
-                       std::filesystem::remove(final_temp_path);
-                       if (!stored.ok()) {
-                           return JsonError(req.version(), "IO_ERROR", stored.error().message,
+                       auto plan = metadata->AllocateWrite(bucket, upload.object_name,
+                                                           replication_factor, service_token);
+                       if (!plan.ok()) {
+                           observability::RecordGatewayMetadataRpcFailure();
+                           return JsonError(req.version(), "ALLOCATE_FAILED", plan.error().message,
+                                            ctx.request_id,
+                                            boost::beast::http::status::internal_server_error);
+                       }
+
+                       std::vector<metadata::ReplicaTarget> composed_replicas;
+                       std::optional<ComposeBlobResult> committed_object;
+                       for (const auto& replica : plan.value().replicas) {
+                           // Compose on replicas that hold every part blob to avoid cross-node part fetches.
+                           bool replica_has_all_parts = true;
+                           for (const auto& locator : ordered_locators) {
+                               if (std::find(locator.endpoints.begin(), locator.endpoints.end(),
+                                             replica.endpoint) == locator.endpoints.end()) {
+                                   replica_has_all_parts = false;
+                                   break;
+                               }
+                           }
+                           if (!replica_has_all_parts) {
+                               observability::RecordGatewayMultipartComposeFailure();
+                               continue;
+                           }
+
+                           auto composed =
+                               ComposeBlobOnNode(replica.endpoint, plan.value().blob_id,
+                                                 ordered_source_blob_ids, service_token,
+                                                 plan.value().write_token);
+                           if (!composed.ok()) {
+                               observability::RecordGatewayMultipartComposeFailure();
+                               continue;
+                           }
+
+                           if (committed_object.has_value() &&
+                               (committed_object->size_bytes != composed.value().size_bytes ||
+                                committed_object->etag != composed.value().etag)) {
+                               observability::RecordGatewayMultipartComposeFailure();
+                               BestEffortDeleteBlobReplicas(plan.value().blob_id, composed_replicas,
+                                                            service_token);
+                               return JsonError(
+                                   req.version(), "IO_ERROR",
+                                   "multipart compose produced inconsistent replica content",
+                                   ctx.request_id,
+                                   boost::beast::http::status::internal_server_error);
+                           }
+
+                           committed_object = composed.value();
+                           composed_replicas.push_back(replica);
+                       }
+
+                       if (!committed_object.has_value() ||
+                           static_cast<int>(composed_replicas.size()) < min_write_acks) {
+                           BestEffortDeleteBlobReplicas(plan.value().blob_id, composed_replicas,
+                                                        service_token);
+                           return JsonError(
+                               req.version(), "IO_ERROR",
+                               "insufficient storage node compose acknowledgements for multipart complete",
+                               ctx.request_id, boost::beast::http::status::internal_server_error);
+                       }
+
+                       auto commit = metadata->CommitWrite(
+                           bucket, upload.object_name, plan.value().blob_id,
+                           committed_object->size_bytes, committed_object->etag, composed_replicas);
+                       if (!commit.ok()) {
+                           observability::RecordGatewayMetadataRpcFailure();
+                           BestEffortDeleteBlobReplicas(plan.value().blob_id, composed_replicas,
+                                                        service_token);
+                           return JsonError(req.version(), "DB_ERROR", commit.error().message,
                                             ctx.request_id,
                                             boost::beast::http::status::internal_server_error);
                        }
@@ -929,12 +1031,13 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataBac
                        (void)metadata->DeleteMultipartParts(upload_id);
                        (void)metadata->DeleteMultipartUpload(upload_id);
                        std::error_code ec;
-                       std::filesystem::remove_all(upload_dir, ec);
+                       std::filesystem::remove_all(MultipartUploadDir(storage->temp_path(), upload_id),
+                                                   ec);
 
                        return JsonOk(req.version(),
                                      "{\"name\":\"" + upload.object_name + "\",\"etag\":\"" +
-                                         stored.value().etag + "\",\"size\":" +
-                                         std::to_string(stored.value().size_bytes) + "}");
+                                         committed_object->etag + "\",\"size\":" +
+                                         std::to_string(committed_object->size_bytes) + "}");
                    });
 
         router.Add("DELETE", "/v1/buckets/{bucket}/multipart-uploads/{upload_id}",
