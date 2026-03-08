@@ -30,6 +30,9 @@ std::atomic<std::uint64_t> g_storage_node_blob_read_latency_ms_sum{0};
 std::atomic<std::uint64_t> g_storage_node_blob_deletes_total{0};
 std::atomic<std::uint64_t> g_storage_node_blob_delete_failures_total{0};
 std::atomic<std::uint64_t> g_storage_node_blob_delete_latency_ms_sum{0};
+std::atomic<std::uint64_t> g_storage_node_blob_composes_total{0};
+std::atomic<std::uint64_t> g_storage_node_blob_compose_failures_total{0};
+std::atomic<std::uint64_t> g_storage_node_blob_compose_latency_ms_sum{0};
 }  // namespace
 
 void RecordRequest(int status_code, long long latency_ms) {
@@ -103,6 +106,15 @@ void RecordStorageNodeDelete(bool success, long long latency_ms) {
                                                         std::memory_order_relaxed);
     if (!success) {
         g_storage_node_blob_delete_failures_total.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void RecordStorageNodeCompose(bool success, long long latency_ms) {
+    g_storage_node_blob_composes_total.fetch_add(1, std::memory_order_relaxed);
+    g_storage_node_blob_compose_latency_ms_sum.fetch_add(static_cast<std::uint64_t>(latency_ms),
+                                                         std::memory_order_relaxed);
+    if (!success) {
+        g_storage_node_blob_compose_failures_total.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -221,6 +233,21 @@ std::string RenderMetrics() {
            "# TYPE nebulafs_storage_node_blob_delete_latency_ms_sum counter\n"
            "nebulafs_storage_node_blob_delete_latency_ms_sum " +
            std::to_string(g_storage_node_blob_delete_latency_ms_sum.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_composes_total Total storage node blob compose requests\n"
+           "# TYPE nebulafs_storage_node_blob_composes_total counter\n"
+           "nebulafs_storage_node_blob_composes_total " +
+           std::to_string(g_storage_node_blob_composes_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_compose_failures_total Total storage node blob compose failures\n"
+           "# TYPE nebulafs_storage_node_blob_compose_failures_total counter\n"
+           "nebulafs_storage_node_blob_compose_failures_total " +
+           std::to_string(g_storage_node_blob_compose_failures_total.load(std::memory_order_relaxed)) +
+           "\n"
+           "# HELP nebulafs_storage_node_blob_compose_latency_ms_sum Sum of storage node blob compose latency in ms\n"
+           "# TYPE nebulafs_storage_node_blob_compose_latency_ms_sum counter\n"
+           "nebulafs_storage_node_blob_compose_latency_ms_sum " +
+           std::to_string(g_storage_node_blob_compose_latency_ms_sum.load(std::memory_order_relaxed)) +
            "\n";
 }
 

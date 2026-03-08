@@ -18,6 +18,16 @@ void RecordGatewayStoragePutFailure();
 void RecordGatewayMetadataRpcFailure();
 /// @brief Record replica fallback on distributed reads.
 void RecordGatewayReplicaFallback();
+/// @brief Record distributed multipart compose failures from gateway.
+void RecordGatewayMultipartComposeFailure();
+/// @brief Record distributed multipart rollback attempts from gateway.
+void RecordGatewayMultipartRollbackAttempt();
+/// @brief Record distributed multipart rollback failures from gateway.
+void RecordGatewayMultipartRollbackFailure();
+/// @brief Record distributed cleanup upload processing outcome from gateway.
+void RecordGatewayDistributedCleanupUpload(bool success);
+/// @brief Record distributed cleanup blob delete outcome from gateway.
+void RecordGatewayDistributedCleanupBlobDelete(bool success);
 /// @brief Record metadata allocate-write request outcome and latency.
 void RecordMetadataAllocate(bool success, long long latency_ms);
 /// @brief Record metadata commit request outcome and latency.
@@ -28,5 +38,7 @@ void RecordStorageNodeWrite(bool success, long long latency_ms);
 void RecordStorageNodeRead(bool success, long long latency_ms);
 /// @brief Record storage node blob delete request outcome and latency.
 void RecordStorageNodeDelete(bool success, long long latency_ms);
+/// @brief Record storage node blob compose request outcome and latency.
+void RecordStorageNodeCompose(bool success, long long latency_ms);
 
 }  // namespace nebulafs::observability

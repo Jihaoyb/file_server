@@ -1,10 +1,17 @@
+#include <array>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
+#include <Poco/DigestEngine.h>
+#include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
+#include <Poco/JSON/Parser.h>
 #include <Poco/Net/HTTPServer.h>
 #include <Poco/Net/HTTPServerParams.h>
 #include <Poco/Net/HTTPRequest.h>
@@ -14,8 +21,10 @@
 #include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/ServerSocket.h>
+#include <Poco/SHA2Engine.h>
 #include <Poco/Thread.h>
 #include <Poco/URI.h>
+#include <Poco/UUIDGenerator.h>
 
 #include "nebulafs/core/config.h"
 #include "nebulafs/core/ids.h"
@@ -49,6 +58,29 @@ bool HasValidPlacementToken(const Poco::Net::HTTPServerRequest& req,
                             const std::string& blob_id) {
     return nebulafs::distributed::ValidatePlacementToken(req.get("X-Placement-Token", ""), blob_id,
                                                          "write", service_token);
+}
+
+std::optional<std::vector<std::string>> ParseComposeSources(std::istream& stream) {
+    try {
+        Poco::JSON::Parser parser;
+        auto root = parser.parse(stream).extract<Poco::JSON::Object::Ptr>();
+        auto source_blob_ids = root->getArray("source_blob_ids");
+        if (!source_blob_ids || source_blob_ids->empty()) {
+            return std::nullopt;
+        }
+        std::vector<std::string> blob_ids;
+        blob_ids.reserve(source_blob_ids->size());
+        for (size_t i = 0; i < source_blob_ids->size(); ++i) {
+            const auto blob_id = source_blob_ids->getElement<std::string>(i);
+            if (blob_id.empty()) {
+                return std::nullopt;
+            }
+            blob_ids.push_back(blob_id);
+        }
+        return blob_ids;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
 }
 
 void WriteJson(Poco::Net::HTTPServerResponse& res, Poco::JSON::Object::Ptr obj,
@@ -117,8 +149,109 @@ public:
             return WriteError(res, request_id, "NOT_FOUND", "route not found",
                               Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
         }
-        const std::string blob_id = path.substr(prefix.size());
+        std::string blob_id = path.substr(prefix.size());
+        bool is_compose_route = false;
+        constexpr const char* kComposeSuffix = "/compose";
+        if (blob_id.size() > std::strlen(kComposeSuffix) &&
+            blob_id.compare(blob_id.size() - std::strlen(kComposeSuffix),
+                            std::strlen(kComposeSuffix), kComposeSuffix) == 0) {
+            is_compose_route = true;
+            blob_id = blob_id.substr(0, blob_id.size() - std::strlen(kComposeSuffix));
+        }
+        if (blob_id.empty()) {
+            return WriteError(res, request_id, "NOT_FOUND", "route not found",
+                              Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+        }
         const auto file_path = BlobPath(root_path_, blob_id);
+
+        if (is_compose_route) {
+            if (req.getMethod() != Poco::Net::HTTPRequest::HTTP_POST) {
+                return WriteError(res, request_id, "METHOD_NOT_ALLOWED", "method not allowed",
+                                  Poco::Net::HTTPResponse::HTTP_METHOD_NOT_ALLOWED);
+            }
+
+            const auto started_at = std::chrono::steady_clock::now();
+            if (!HasValidPlacementToken(req, service_token_, blob_id)) {
+                nebulafs::observability::RecordStorageNodeCompose(false, ElapsedMs(started_at));
+                return WriteError(res, request_id, "UNAUTHORIZED", "invalid placement token",
+                                  Poco::Net::HTTPResponse::HTTP_UNAUTHORIZED);
+            }
+
+            auto source_blob_ids = ParseComposeSources(req.stream());
+            if (!source_blob_ids.has_value()) {
+                nebulafs::observability::RecordStorageNodeCompose(false, ElapsedMs(started_at));
+                return WriteError(res, request_id, "INVALID_REQUEST",
+                                  "source_blob_ids must be a non-empty array",
+                                  Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+            }
+
+            const auto temp_path =
+                BlobPath(root_path_, Poco::UUIDGenerator().createOne().toString() + ".compose.tmp");
+            std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+            if (!out.is_open()) {
+                nebulafs::observability::RecordStorageNodeCompose(false, ElapsedMs(started_at));
+                return WriteError(res, request_id, "INTERNAL_ERROR",
+                                  "failed to open compose temp file",
+                                  Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            }
+
+            Poco::SHA2Engine256 sha256;
+            std::array<char, 8192> buffer{};
+            std::uint64_t total_bytes = 0;
+            for (const auto& source_blob_id : source_blob_ids.value()) {
+                const auto source_path = BlobPath(root_path_, source_blob_id);
+                std::ifstream in(source_path, std::ios::binary);
+                if (!in.is_open()) {
+                    out.close();
+                    std::error_code remove_ec;
+                    std::filesystem::remove(temp_path, remove_ec);
+                    nebulafs::observability::RecordStorageNodeCompose(false, ElapsedMs(started_at));
+                    return WriteError(res, request_id, "NOT_FOUND",
+                                      "source blob not found: " + source_blob_id,
+                                      Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                }
+                while (in) {
+                    in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                    const auto bytes = in.gcount();
+                    if (bytes <= 0) {
+                        break;
+                    }
+                    out.write(buffer.data(), bytes);
+                    if (!out) {
+                        out.close();
+                        std::error_code remove_ec;
+                        std::filesystem::remove(temp_path, remove_ec);
+                        nebulafs::observability::RecordStorageNodeCompose(false,
+                                                                          ElapsedMs(started_at));
+                        return WriteError(res, request_id, "INTERNAL_ERROR",
+                                          "failed to write compose output",
+                                          Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+                    }
+                    sha256.update(buffer.data(), static_cast<unsigned int>(bytes));
+                    total_bytes += static_cast<std::uint64_t>(bytes);
+                }
+            }
+
+            out.flush();
+            out.close();
+
+            std::error_code rename_ec;
+            std::filesystem::rename(temp_path, file_path, rename_ec);
+            if (rename_ec) {
+                std::error_code remove_ec;
+                std::filesystem::remove(temp_path, remove_ec);
+                nebulafs::observability::RecordStorageNodeCompose(false, ElapsedMs(started_at));
+                return WriteError(res, request_id, "INTERNAL_ERROR", rename_ec.message(),
+                                  Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            }
+
+            nebulafs::observability::RecordStorageNodeCompose(true, ElapsedMs(started_at));
+            Poco::JSON::Object::Ptr root = new Poco::JSON::Object();
+            root->set("blob_id", blob_id);
+            root->set("size_bytes", static_cast<Poco::UInt64>(total_bytes));
+            root->set("etag", Poco::DigestEngine::digestToHex(sha256.digest()));
+            return WriteJson(res, root, Poco::Net::HTTPResponse::HTTP_OK, request_id);
+        }
 
         if (req.getMethod() == Poco::Net::HTTPRequest::HTTP_PUT) {
             const auto started_at = std::chrono::steady_clock::now();
