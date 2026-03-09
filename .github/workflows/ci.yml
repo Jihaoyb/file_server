@@ -2,6 +2,8 @@ name: ci
 
 on:
   push:
+    tags-ignore:
+      - '*'
   pull_request:
 
 jobs:
@@ -32,10 +34,16 @@ jobs:
           vcpkgGitCommitId: 01e159b519b7e791cc5bb3548663a26d9c0922a3
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        run: cmake --preset debug -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+        run: |
+          # Retry configure to tolerate transient vcpkg/download errors.
+          cmake --preset debug -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+            || cmake --preset debug -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+            || cmake --preset debug -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
       - name: Configure (Unix)
         if: runner.os != 'Windows'
-        run: cmake --preset debug
+        run: |
+          # Retry configure to tolerate transient vcpkg/download errors.
+          cmake --preset debug || cmake --preset debug || cmake --preset debug
       - name: Build
         run: cmake --build --preset debug
       - name: Test
@@ -59,7 +67,9 @@ jobs:
         with:
           vcpkgGitCommitId: 01e159b519b7e791cc5bb3548663a26d9c0922a3
       - name: Configure
-        run: cmake --preset debug
+        run: |
+          # Retry configure to tolerate transient vcpkg/download errors.
+          cmake --preset debug || cmake --preset debug || cmake --preset debug
       - name: Build
         run: cmake --build --preset debug
       - name: Distributed integration test lane
