@@ -475,7 +475,8 @@ private:
             if (asset) {
                 http::response<http::string_body> response{http::status::ok, request.version()};
                 response.set(http::field::content_type, asset->content_type.data());
-                response.set(http::field::cache_control, "no-store");
+                // Keep intermediaries from injecting scripts into the pilot page.
+                response.set(http::field::cache_control, "no-store, no-transform");
                 response.set("X-Content-Type-Options", "nosniff");
                 response.set("Referrer-Policy", "no-referrer");
                 response.set("Content-Security-Policy",
