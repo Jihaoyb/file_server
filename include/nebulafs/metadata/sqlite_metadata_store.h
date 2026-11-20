@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
+#include <utility>
 #include <string>
 
 #include <Poco/Data/Session.h>
@@ -9,10 +11,37 @@
 
 namespace nebulafs::metadata {
 
+/// Immutable source identity and durable completion receipt for the browser pilot.
+struct VerifiedUpload {
+    std::string upload_id;
+    std::string display_name;
+    std::string sha256;
+    std::uint64_t size_bytes{0};
+    std::string state;
+    std::string expires_at;
+    std::int64_t completed_at{0};
+    std::int64_t finalization_ms{0};
+    std::string error;
+};
+
 /// @brief SQLite-backed metadata store for single-node mode.
 class SqliteMetadataStore : public MetadataStore {
 public:
     explicit SqliteMetadataStore(const std::string& db_path);
+
+    // Serialize mutations involving both disk and SQLite, including the expiry sweep.
+    std::mutex& upload_mutex() { return upload_mutex_; }
+    core::Result<VerifiedUpload> CreateVerifiedUpload(const std::string& bucket, VerifiedUpload upload);
+    core::Result<VerifiedUpload> GetVerifiedUpload(const std::string& bucket,
+                                                 const std::string& upload_id);
+    std::pair<std::uint64_t, std::string> InspectPartSlot(const std::string& upload_id, int number);
+    void RecordVerifiedPart(const MultipartPart& part, const std::string& expires_at);
+    void SetVerifiedState(const std::string& upload_id, const std::string& state,
+                          const std::string& error);
+    void CommitVerifiedUpload(const VerifiedUpload& upload, std::int64_t elapsed_ms);
+    void RecoverVerifiedUploads(const std::string& base_path, const std::string& temp_path);
+    std::vector<std::string> ListExpiredVerifiedCompletions(std::int64_t cutoff, int limit);
+    void DeleteExpiredVerifiedCompletion(const std::string& upload_id);
 
     core::Result<Bucket> CreateBucket(const std::string& name) override;
     core::Result<std::vector<Bucket>> ListBuckets() override;
@@ -65,6 +94,8 @@ public:
 private:
     // Schema creation is done once per store instance; in production this will be migrated.
     void InitSchema();
+    std::string db_path_;
+    std::mutex upload_mutex_;
     Poco::Data::Session session_;
 };
 

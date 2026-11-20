@@ -1,0 +1,22 @@
+#pragma once
+
+#include <array>
+#include <string_view>
+
+namespace nebulafs::http::pilot_web {
+
+struct Asset {
+    std::string_view path;
+    std::string_view content_type;
+    std::string_view body;
+};
+
+inline constexpr std::array<Asset, 5> kAssets{{
+    {"/", "text/html; charset=utf-8", R"pilot_asset(@PILOT_HTML@)pilot_asset"},
+    {"/pilot/styles.css", "text/css; charset=utf-8", R"pilot_asset(@PILOT_CSS@)pilot_asset"},
+    {"/pilot/app.js", "text/javascript; charset=utf-8", R"pilot_asset(@PILOT_JS@)pilot_asset"},
+    {"/pilot/sha256.js", "text/javascript; charset=utf-8", R"pilot_asset(@PILOT_SHA256@)pilot_asset"},
+    {"/pilot/sha256-worker.js", "text/javascript; charset=utf-8", R"pilot_asset(@PILOT_WORKER@)pilot_asset"},
+}};
+
+}  // namespace nebulafs::http::pilot_web

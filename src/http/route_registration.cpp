@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -19,6 +20,7 @@
 #include <Poco/UUIDGenerator.h>
 
 #include "nebulafs/core/time.h"
+#include "nebulafs/http/verified_multipart.h"
 #include "nebulafs/distributed/http_client.h"
 #include "nebulafs/metadata/metadata_store.h"
 #include "nebulafs/observability/metrics.h"
@@ -371,6 +373,12 @@ void RegisterDefaultRoutes(Router& router, std::shared_ptr<metadata::MetadataBac
                });
 
     if (config.server.mode == "single_node") {
+        if (const char* token = std::getenv("NEBULAFS_PILOT_UPLOAD_TOKEN"); token && *token) {
+            auto sqlite = std::dynamic_pointer_cast<metadata::SqliteMetadataStore>(metadata);
+            if (!sqlite) throw std::runtime_error("pilot uploads require SQLite metadata");
+            RegisterVerifiedMultipart(router, sqlite, storage, config.storage.multipart.max_upload_ttl_seconds);
+        }
+
         router.Add("POST", "/v1/buckets/{bucket}/multipart-uploads",
                [metadata,
                 ttl_seconds = config.storage.multipart.max_upload_ttl_seconds](

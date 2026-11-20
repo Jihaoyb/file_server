@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NebulaFS</title>
+  <link rel="stylesheet" href="/pilot/styles.css">
+  <script type="module" src="/pilot/app.js"></script>
+</head>
+<body>
+  <header class="brand">NebulaFS</header>
+  <main>
+    <section class="card" aria-labelledby="page-title">
+      <h1 id="page-title">Send a file</h1>
+      <p class="description">Send files up to 12 GB.</p>
+      <form id="upload-form">
+        <div id="recovery" hidden>
+          <label for="saved-upload">Saved upload</label>
+          <select id="saved-upload">
+            <option value="">Start a new upload</option>
+          </select>
+          <p id="recovery-hint"></p>
+        </div>
+        <label for="upload-code">Upload code</label>
+        <input type="password" id="upload-code" autocomplete="off" spellcheck="false" required>
+        <label for="file">File</label>
+        <input type="file" id="file" required>
+        <button type="submit" id="upload">Upload file</button>
+      </form>
+      <progress id="progress" aria-label="Transfer progress" max="1" value="0" hidden></progress>
+      <p id="status" role="status" hidden></p>
+      <p id="metrics" hidden></p>
+      <p id="error" role="alert" hidden></p>
+      <section id="share" aria-label="Share the verified file" hidden>
+        <p id="receipt"></p>
+        <button type="button" id="create-link">Create download link</button>
+        <div id="link-result" hidden>
+          <label for="download-link">Download link</label>
+          <input type="url" id="download-link" readonly>
+          <button type="button" id="copy-link">Copy link</button>
+          <p id="link-expiry"></p>
+        </div>
+      </section>
+      <noscript>Enable JavaScript to upload a file.</noscript>
+    </section>
+  </main>
+</body>
+</html>

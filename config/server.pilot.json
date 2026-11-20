@@ -1,0 +1,21 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "mode": "single_node",
+    "tls": {
+      "enabled": false
+    },
+    "limits": {
+      "max_body_bytes": 67108864,
+      "request_timeout_ms": 90000
+    }
+  },
+  "storage": {
+    "base_path": "/app/data",
+    "temp_path": "/app/data/tmp"
+  },
+  "auth": {
+    "enabled": false
+  }
+}

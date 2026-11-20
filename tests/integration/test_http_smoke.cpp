@@ -2,6 +2,9 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <Poco/Data/SQLite/Connector.h>
+#include <Poco/Data/Session.h>
+#include <Poco/Data/Statement.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/Process.h>
@@ -27,6 +30,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -600,6 +604,17 @@ TEST(IntegrationHttp, BasicCrudSmoke) {
                                  {{"Range", "bytes=0-4"}});
         EXPECT_EQ(range.result(), http::status::partial_content);
         EXPECT_EQ(range.body(), "hello");
+
+        auto suffix = SendRequest(http::verb::get, "127.0.0.1", port,
+                                  "/v1/buckets/demo/objects/readme.txt", "", "",
+                                  {{"Range", "bytes=-5"}});
+        EXPECT_EQ(suffix.result(), http::status::partial_content);
+        EXPECT_EQ(suffix.body(), payload.substr(payload.size() - 5));
+
+        auto malformed = SendRequest(http::verb::get, "127.0.0.1", port,
+                                     "/v1/buckets/demo/objects/readme.txt", "", "",
+                                     {{"Range", "bytes=oops-4"}});
+        EXPECT_EQ(malformed.result(), http::status::range_not_satisfiable);
 
         auto del = SendRequest(http::verb::delete_, "127.0.0.1", port,
                                "/v1/buckets/demo/objects/readme.txt", "", "");
@@ -1972,4 +1987,172 @@ TEST(IntegrationHttp, AuthValidation) {
     }
 
     CleanupTempDir(temp_dir);
+}
+
+TEST(IntegrationHttp, VerifiedFinalizationSurvivesFailuresAndRestart) {
+    const auto dir = MakeTempDir();
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() { CleanupTempDir(dir); }
+    } cleanup{dir};
+    auto port = FindFreePort();
+    const auto config = WriteServerConfig(dir, port);
+    const auto database = WriteDatabaseConfig(dir);
+    const Poco::Process::Args args{"--config", config.string(), "--database", database.string()};
+    const std::string key(64, 'a');
+    const Poco::Process::Env env{{"NEBULAFS_PILOT_UPLOAD_TOKEN", key},
+                                 {"NEBULAFS_PILOT_DOWNLOAD_KEY", std::string(64, 'b')}};
+    const auto launch = [&] {
+        return ServerProcess(Poco::Process::launch(NEBULAFS_SERVER_PATH, args, nullptr, nullptr,
+                                                   nullptr, env));
+    };
+    const auto request = [&](http::verb method, const std::string& path, const std::string& body = "") {
+        return SendRequest(method, "127.0.0.1", port, path, body, "application/json",
+                           {{"Authorization", "Bearer " + key}});
+    };
+    const auto parse = [](const auto& response) {
+        return Poco::JSON::Parser().parse(response.body()).template extract<Poco::JSON::Object::Ptr>();
+    };
+    const auto poll = [&](const std::string& path, const std::string& expected) {
+        for (int n = 0; n < 200; ++n) {
+            auto reply = request(http::verb::get, path + "/status");
+            if (reply.result() == http::status::ok && parse(reply)->getValue<std::string>("state") == expected) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    };
+
+    const std::string base = "/v1/buckets/pilot/multipart-uploads";
+    const std::string digest = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const auto init = "{\"object\":\"你好.txt\",\"sha256\":\"" + digest + "\",\"size\":5}";
+    const auto manifest = "{\"parts\":[{\"part_number\":1,\"etag\":\"" + digest + "\"}]}";
+    std::string id;
+    {
+        auto server = launch();
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", port));
+        EXPECT_EQ(request(http::verb::post, base, "{}").result(), http::status::bad_request);
+        auto started = request(http::verb::post, base, init);
+        ASSERT_EQ(started.result(), http::status::ok) << started.body();
+        id = parse(started)->getValue<std::string>("upload_id");
+        EXPECT_EQ(request(http::verb::post, base, init).result(), http::status::conflict);
+        auto path = base + "/" + id;
+        EXPECT_EQ(request(http::verb::post, path + "/download-link").result(),
+                  http::status::not_found);
+        EXPECT_EQ(request(http::verb::put, path + "/parts/16385", "hello").result(), http::status::bad_request);
+        const auto part_dir = dir / "storage" / "tmp" / "multipart" / id;
+        std::filesystem::create_directories(part_dir);
+        const auto incoming = part_dir / "incoming";
+        if (std::filesystem::exists("/dev/full")) {
+            std::filesystem::create_symlink("/dev/full", incoming);
+        } else {
+            std::filesystem::create_directory(incoming);
+        }
+        EXPECT_EQ(request(http::verb::put, path + "/parts/1", "hello").result(),
+                  http::status::internal_server_error);
+        EXPECT_EQ(parse(request(http::verb::get, path + "/parts"))->getArray("parts")->size(), 0U);
+        ASSERT_EQ(request(http::verb::put, path + "/parts/1", "hello").result(), http::status::ok);
+        EXPECT_EQ(request(http::verb::put, path + "/parts/1", "wrong").result(), http::status::conflict);
+    }
+    const auto path = base + "/" + id;
+    const auto part_dir = dir / "storage" / "tmp" / "multipart" / id;
+    const auto object_dir = dir / "storage" / "buckets" / "pilot" / "objects";
+    {
+        auto server = launch();
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", port));
+        auto parts = request(http::verb::get, path + "/parts");
+        ASSERT_EQ(parse(parts)->getArray("parts")->size(), 1U);
+
+        // Linux's full device reports ENOSPC on write/flush. Other platforms get
+        // a deterministic assembly I/O failure by placing a directory at the output.
+        const auto staging = part_dir / "assembly";
+        if (std::filesystem::exists("/dev/full")) {
+            std::filesystem::create_symlink("/dev/full", staging);
+        } else {
+            std::filesystem::create_directory(staging);
+        }
+        // Simulate SQLite also failing to persist the worker's rollback. After the
+        // host is writable, a status poll must recover without restarting the service.
+        Poco::Data::Session fault_db(Poco::Data::SQLite::Connector().createSession(
+            (dir / "metadata.db").string()));
+        fault_db << "CREATE TRIGGER fail_rollback BEFORE UPDATE OF state ON multipart_uploads "
+                    "WHEN OLD.state='finalizing' AND NEW.state='uploading' "
+                    "BEGIN SELECT RAISE(ABORT,'injected rollback failure'); END",
+            Poco::Data::Keywords::now;
+        ASSERT_EQ(request(http::verb::post, path + "/complete", manifest).result(), http::status::accepted);
+        bool rollback_failed = false;
+        for (int attempt = 0; attempt < 200 && !rollback_failed; ++attempt) {
+            rollback_failed = request(http::verb::get, path + "/status").result() ==
+                              http::status::internal_server_error;
+            if (!rollback_failed) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(rollback_failed);
+        fault_db << "DROP TRIGGER fail_rollback", Poco::Data::Keywords::now;
+        ASSERT_TRUE(poll(path, "uploading"));
+        EXPECT_FALSE(std::filesystem::exists(object_dir / id));
+        EXPECT_FALSE(parse(request(http::verb::get, path + "/status"))->getValue<std::string>("error").empty());
+
+        // Distinguish a source digest mismatch from a successfully assembled but corrupted part.
+        const auto file = part_dir / ("part-1-" + digest);
+        std::ofstream(file, std::ios::binary | std::ios::trunc) << "wrong";
+        ASSERT_EQ(request(http::verb::post, path + "/complete", manifest).result(), http::status::accepted);
+        ASSERT_TRUE(poll(path, "uploading"));
+        EXPECT_FALSE(std::filesystem::exists(object_dir / id));
+        std::ofstream(file, std::ios::binary | std::ios::trunc) << "hello";
+
+#ifndef _WIN32
+        // Hold the worker at a part read to reproduce assembly outliving a client's first request.
+        std::filesystem::remove(file);
+        ASSERT_EQ(::mkfifo(file.c_str(), 0600), 0);
+#endif
+        // Client disconnects before reading the completion response.
+        net::io_context ioc;
+        beast::tcp_stream stream(ioc);
+        stream.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), port));
+        http::request<http::string_body> complete{http::verb::post, path + "/complete", 11};
+        complete.set(http::field::host, "127.0.0.1");
+        complete.set(http::field::authorization, "Bearer " + key);
+        complete.body() = manifest;
+        complete.prepare_payload();
+        http::write(stream, complete);
+        stream.socket().close();
+#ifndef _WIN32
+        ASSERT_TRUE(poll(path, "finalizing"));
+        EXPECT_EQ(request(http::verb::post, path + "/complete", manifest).result(),
+                  http::status::accepted);
+        EXPECT_EQ(request(http::verb::delete_, path).result(), http::status::conflict);
+        std::ofstream(file, std::ios::binary) << "hello";
+#endif
+        ASSERT_TRUE(poll(path, "completed"));
+    }
+    {
+        auto server = launch();
+        ASSERT_TRUE(WaitForHealth("127.0.0.1", port));
+        auto receipt = request(http::verb::get, path + "/status");
+        ASSERT_EQ(receipt.result(), http::status::ok);
+        EXPECT_EQ(parse(receipt)->getValue<std::string>("sha256"), digest);
+        EXPECT_EQ(parse(receipt)->getValue<std::string>("name"), "你好.txt");
+        auto retry = request(http::verb::post, path + "/complete", manifest);
+        EXPECT_EQ(retry.result(), http::status::ok);
+        EXPECT_EQ(retry.body(), receipt.body());
+        EXPECT_EQ(CountRegularFiles(object_dir), 1U);
+        EXPECT_EQ(std::filesystem::file_size(object_dir / id), 5U);
+
+        auto link = request(http::verb::post, path + "/download-link");
+        ASSERT_EQ(link.result(), http::status::ok);
+        auto url = parse(link)->getValue<std::string>("url");
+        auto received = SendRequest(http::verb::get, "127.0.0.1", port, url, "", "");
+        EXPECT_EQ(received.result(), http::status::ok);
+        EXPECT_EQ(received.body(), "hello");
+        EXPECT_EQ(received[http::field::cache_control], "private, no-store");
+        auto range = SendRequest(http::verb::get, "127.0.0.1", port, url, "", "",
+                                 {{"Range", "bytes=1-3"}});
+        EXPECT_EQ(range.result(), http::status::partial_content);
+        EXPECT_EQ(range.body(), "ell");
+        ASSERT_FALSE(url.empty());
+        url.back() = url.back() == '0' ? '1' : '0';
+        EXPECT_EQ(SendRequest(http::verb::get, "127.0.0.1", port, url, "", "").result(),
+                  http::status::not_found);
+    }
 }

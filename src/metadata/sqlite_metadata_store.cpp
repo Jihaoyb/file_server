@@ -16,7 +16,7 @@ using namespace Poco::Data::Keywords;
 namespace nebulafs::metadata {
 
 SqliteMetadataStore::SqliteMetadataStore(const std::string& db_path)
-    : session_([](const std::string& path) {
+    : db_path_(db_path), session_([](const std::string& path) {
           Poco::Data::SQLite::Connector::registerConnector();
           return Poco::Data::Session("SQLite", path);
       }(db_path)) {
@@ -75,6 +75,14 @@ void SqliteMetadataStore::InitSchema() {
             "UNIQUE(upload_id, part_number),"
             "FOREIGN KEY(upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE"
             ")",
+        now;
+
+    session_ <<
+            "CREATE TABLE IF NOT EXISTS verified_uploads ("
+            "upload_id TEXT PRIMARY KEY REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE,"
+            "display_name TEXT NOT NULL, sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL,"
+            "completed_at INTEGER NOT NULL DEFAULT 0, finalization_ms INTEGER NOT NULL DEFAULT 0,"
+            "error TEXT NOT NULL DEFAULT '')",
         now;
 
     session_ <<
