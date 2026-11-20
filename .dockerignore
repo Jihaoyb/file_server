@@ -1,0 +1,13 @@
+*
+!CMakeLists.txt
+!LICENSE
+!CMakePresets.json
+!vcpkg.json
+!include/
+!include/**
+!src/
+!src/**
+!web/
+!web/**
+!config/
+!config/database.json

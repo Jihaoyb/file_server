@@ -1,3 +1,4 @@
 # Runbooks
 
-Operational guides for NebulaFS (cert rotation, backups, scaling) will live here.
+- [Docker and Windows pilot deployment](../../deploy/compose/README.md)
+- [Cross-border pilot benchmark](pilot-benchmark.md)

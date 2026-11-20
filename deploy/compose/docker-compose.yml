@@ -1,11 +1,28 @@
-version: "3.9"
 services:
   nebulafs:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${NEBULAFS_HOST_PORT:-8080}:8080"
     volumes:
-      - ../data:/app/data
-    command: ["./nebulafs", "--config", "config/server.json"]
+      - nebulafs-data:/app/data
+      - type: bind
+        source: ${NEBULAFS_CONFIG_FILE:-../../config/server.json}
+        target: /run/nebulafs/server.json
+        read_only: true
+        bind:
+          create_host_path: false
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --fail --silent --max-time 2 http://127.0.0.1:8080/healthz >/dev/null && curl --fail --silent --max-time 2 http://127.0.0.1:8080/readyz >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  nebulafs-data:

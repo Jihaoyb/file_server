@@ -34,6 +34,8 @@ private:
     std::shared_ptr<storage::StorageBackend> storage_;
     std::shared_ptr<metadata::MetadataBackend> metadata_;
     std::shared_ptr<auth::JwtVerifier> auth_verifier_;
+    std::shared_ptr<const std::string> pilot_upload_token_;
+    std::shared_ptr<const std::string> pilot_download_key_;
     std::unique_ptr<boost::asio::ssl::context> ssl_context_;
     std::unique_ptr<boost::asio::steady_timer> cleanup_timer_;
 };

@@ -1,0 +1,12 @@
+services:
+  nebulafs:
+    environment:
+      NEBULAFS_PILOT_UPLOAD_TOKEN: ${NEBULAFS_PILOT_UPLOAD_TOKEN:?Set a private pilot upload token}
+      NEBULAFS_PILOT_DOWNLOAD_KEY: ${NEBULAFS_PILOT_DOWNLOAD_KEY:?Set a private pilot download signing key}
+    volumes:
+      - type: bind
+        source: ${NEBULAFS_PILOT_CONFIG_FILE:-../../config/server.pilot.json}
+        target: /run/nebulafs/server.json
+        read_only: true
+        bind:
+          create_host_path: false

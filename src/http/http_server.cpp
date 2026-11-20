@@ -3,13 +3,16 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -26,6 +29,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
+#include <openssl/crypto.h>
 
 #include "nebulafs/core/ids.h"
 #include "nebulafs/core/logger.h"
@@ -35,6 +39,9 @@
 #include "nebulafs/auth/jwt_utils.h"
 #include "nebulafs/auth/jwt_verifier.h"
 #include "nebulafs/storage/local_storage.h"
+#include "nebulafs/metadata/sqlite_metadata_store.h"
+#include "pilot_download_token.h"
+#include "pilot_web_assets.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -50,6 +57,64 @@ namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
 constexpr std::size_t kBufferSize = 8192;
+constexpr std::int64_t kDownloadLifetime = 24 * 60 * 60;
+constexpr std::int64_t kFileRetention = 7 * kDownloadLifetime;
+
+std::int64_t EpochSeconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+class DownloadFile : public beast::file {
+public:
+    void SetEnd(std::uint64_t end) { end_ = end; }
+
+    std::uint64_t size(beast::error_code& ec) const {
+        const auto size = beast::file::size(ec);
+        return end_ ? std::min(size, *end_) : size;
+    }
+
+private:
+    std::optional<std::uint64_t> end_;
+};
+
+std::optional<nebulafs::http::pilot_web::Asset> FindPilotAsset(http::verb method,
+                                                              const std::string& path) {
+    if (method != http::verb::get) {
+        return std::nullopt;
+    }
+    for (const auto& asset : nebulafs::http::pilot_web::kAssets) {
+        if (asset.path == path) {
+            return asset;
+        }
+    }
+    return std::nullopt;
+}
+
+bool IsPilotUploadRoute(http::verb method, const std::string& path) {
+    using nebulafs::http::Router;
+    constexpr auto kSession = "/v1/buckets/pilot/multipart-uploads/{upload_id}";
+    switch (method) {
+    case http::verb::post:
+        return Router::Match("/v1/buckets/pilot/multipart-uploads", path, nullptr) ||
+               Router::Match("/v1/buckets/pilot/multipart-uploads/{upload_id}/complete", path,
+                             nullptr) ||
+               Router::Match("/v1/buckets/pilot/multipart-uploads/{upload_id}/download-link", path,
+                             nullptr);
+    case http::verb::put:
+        return Router::Match("/v1/buckets/pilot/multipart-uploads/{upload_id}/parts/{part_number}",
+                             path, nullptr);
+    case http::verb::get:
+        return Router::Match("/v1/buckets/pilot/multipart-uploads/{upload_id}/parts", path,
+                             nullptr) ||
+               Router::Match("/v1/buckets/pilot/multipart-uploads/{upload_id}/status", path,
+                             nullptr);
+    case http::verb::delete_:
+        return Router::Match(kSession, path, nullptr);
+    default:
+        return false;
+    }
+}
 
 class RateLimiter {
 public:
@@ -159,32 +224,38 @@ std::optional<DistributedPartLocator> DecodePartLocator(const std::string& encod
 }
 
 std::optional<RangeRequest> ParseRange(const std::string& header, std::uint64_t size) {
-    // We only accept byte ranges; other units are rejected early.
-    if (header.rfind("bytes=", 0) != 0) {
+    if (!header.starts_with("bytes=") || size == 0) {
         return std::nullopt;
     }
-    auto range = header.substr(6);
+    const auto range = std::string_view(header).substr(6);
     auto dash = range.find('-');
     if (dash == std::string::npos) {
         return std::nullopt;
     }
-    std::string start_str = range.substr(0, dash);
-    std::string end_str = range.substr(dash + 1);
-
-    RangeRequest req;
-    if (start_str.empty()) {
+    const auto parse_offset = [](std::string_view value, std::uint64_t& offset) {
+        const auto end = value.data() + value.size();
+        const auto parsed = std::from_chars(value.data(), end, offset);
+        return parsed.ec == std::errc{} && parsed.ptr == end;
+    };
+    const auto start = range.substr(0, dash);
+    const auto end = range.substr(dash + 1);
+    RangeRequest request{0, size - 1};
+    if (start.empty()) {
+        std::uint64_t suffix_size = 0;
+        if (!parse_offset(end, suffix_size) || suffix_size == 0) {
+            return std::nullopt;
+        }
+        request.start = size - std::min(size, suffix_size);
+        return request;
+    }
+    if (!parse_offset(start, request.start) || request.start >= size) {
         return std::nullopt;
     }
-    req.start = static_cast<std::uint64_t>(std::stoull(start_str));
-    if (end_str.empty()) {
-        req.end = size - 1;
-    } else {
-        req.end = static_cast<std::uint64_t>(std::stoull(end_str));
-    }
-    if (req.start > req.end || req.start >= size) {
+    if (!end.empty() && (!parse_offset(end, request.end) || request.end < request.start)) {
         return std::nullopt;
     }
-    return req;
+    request.end = std::min(request.end, size - 1);
+    return request;
 }
 
 http::response<http::string_body> JsonResponse(http::status status, int version,
@@ -218,6 +289,8 @@ public:
             std::shared_ptr<nebulafs::storage::StorageBackend> storage,
             std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata,
             std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier,
+            std::shared_ptr<const std::string> pilot_upload_token,
+            std::shared_ptr<const std::string> pilot_download_key,
             std::shared_ptr<RateLimiter> rate_limiter)
         : stream_(std::move(stream)),
           router_(std::move(router)),
@@ -225,6 +298,8 @@ public:
           storage_(std::move(storage)),
           metadata_(std::move(metadata)),
           auth_verifier_(std::move(auth_verifier)),
+          pilot_upload_token_(std::move(pilot_upload_token)),
+          pilot_download_key_(std::move(pilot_download_key)),
           rate_limiter_(std::move(rate_limiter)) {
     }
 
@@ -395,6 +470,34 @@ private:
         if (auth_response) {
             return Send(std::move(*auth_response));
         }
+        if (pilot_upload_token_) {
+            auto asset = FindPilotAsset(request.method(), path);
+            if (asset) {
+                http::response<http::string_body> response{http::status::ok, request.version()};
+                response.set(http::field::content_type, asset->content_type.data());
+                response.set(http::field::cache_control, "no-store");
+                response.set("X-Content-Type-Options", "nosniff");
+                response.set("Referrer-Policy", "no-referrer");
+                response.set("Content-Security-Policy",
+                             "default-src 'none'; script-src 'self'; style-src 'self'; "
+                             "worker-src 'self'; connect-src 'self'; base-uri 'none'; "
+                             "form-action 'none'; frame-ancestors 'none'");
+                response.body() = asset->body;
+                response.prepare_payload();
+                return Send(std::move(response));
+            }
+        }
+        if (pilot_download_key_ && request.method() == http::verb::get &&
+            path.starts_with("/d/")) {
+            return HandlePilotDownload(request, path.substr(3));
+        }
+        nebulafs::http::RouteParams share_params;
+        if (pilot_download_key_ && request.method() == http::verb::post &&
+            nebulafs::http::Router::Match(
+                "/v1/buckets/pilot/multipart-uploads/{upload_id}/download-link", path,
+                &share_params)) {
+            return CreatePilotDownload(request, share_params.at("upload_id"));
+        }
         if (request.method() == http::verb::get && IsObjectPath(path)) {
             return HandleDownload(request, path);
         }
@@ -415,7 +518,7 @@ private:
     }
 
     bool IsPublicPath(const std::string& path) const {
-        // Keep only health endpoints public; /metrics stays protected when auth is enabled.
+        // Keep health endpoints public; /metrics stays protected when auth is enabled.
         return path == "/healthz" || path == "/readyz";
     }
 
@@ -444,14 +547,29 @@ private:
     template <typename Request>
     std::optional<http::response<http::string_body>> EnsureAuthorized(const Request& request,
                                                                       const std::string& path) {
-        // Skip auth when disabled or for public endpoints.
-        if (!config_.auth.enabled || IsPublicPath(path)) {
+        if (IsPublicPath(path) ||
+            (pilot_download_key_ && request.method() == http::verb::get && path.starts_with("/d/")) ||
+            (pilot_upload_token_ && FindPilotAsset(request.method(), path))) {
+            return std::nullopt;
+        }
+        if (!config_.auth.enabled && !pilot_upload_token_) {
             return std::nullopt;
         }
         auto token = ExtractBearerToken(request);
         if (!token || token->empty()) {
             return ErrorResponse(http::status::unauthorized, request.version(), "UNAUTHORIZED",
                                  "missing bearer token", request_id_);
+        }
+        if (pilot_upload_token_ && IsPilotUploadRoute(request.method(), path) &&
+            token->size() == pilot_upload_token_->size() &&
+            CRYPTO_memcmp(token->data(), pilot_upload_token_->data(), token->size()) == 0) {
+            auth_claims_ = nebulafs::auth::JwtClaims{
+                "invite", "nebulafs:pilot", {}, {}};
+            return std::nullopt;
+        }
+        if (!config_.auth.enabled) {
+            return ErrorResponse(http::status::unauthorized, request.version(), "UNAUTHORIZED",
+                                 "invalid upload code or unavailable route", request_id_);
         }
         auto result = auth_verifier_->Verify(*token);
         if (!result.ok()) {
@@ -629,6 +747,76 @@ private:
         const auto bucket = params["bucket"];
         const auto object = params["object"];
 
+        SendDownload(request, bucket, object);
+    }
+
+    std::optional<nebulafs::metadata::VerifiedUpload> FindPilotDownload(
+        const std::string& upload_id, std::int64_t now) {
+        const auto store = std::dynamic_pointer_cast<nebulafs::metadata::SqliteMetadataStore>(
+            metadata_);
+        if (!store) {
+            return std::nullopt;
+        }
+        try {
+            auto result = store->GetVerifiedUpload("pilot", upload_id);
+            if (result.ok() && result.value().state == "completed" &&
+                result.value().completed_at + kFileRetention > now) {
+                return std::move(result.value());
+            }
+        } catch (const std::exception& e) {
+            nebulafs::core::LogError("Could not read the verified download receipt: " +
+                                     std::string(e.what()));
+        }
+        return std::nullopt;
+    }
+
+    void CreatePilotDownload(const nebulafs::http::HttpRequest& request,
+                             const std::string& upload_id) {
+        const auto now = EpochSeconds();
+        const auto upload = FindPilotDownload(upload_id, now);
+        if (!upload) {
+            return PilotDownloadNotFound(request);
+        }
+        const auto expiry = std::min(now + kDownloadLifetime,
+                                     upload->completed_at + kFileRetention);
+        const auto token = nebulafs::http::pilot_download::Create(upload->upload_id, expiry,
+                                                                 *pilot_download_key_);
+        if (token.empty()) {
+            return Send(ErrorResponse(http::status::internal_server_error, request.version(),
+                                      "IO_ERROR", "could not create download link", request_id_));
+        }
+        auto response = JsonResponse(http::status::ok, request.version(),
+                                     "{\"url\":\"/d/" + token + "\",\"expires_at\":" +
+                                         std::to_string(expiry) + "}");
+        response.set(http::field::cache_control, "no-store");
+        Send(std::move(response));
+    }
+
+    void PilotDownloadNotFound(const nebulafs::http::HttpRequest& request) {
+        auto response = ErrorResponse(http::status::not_found, request.version(),
+                                      "DOWNLOAD_NOT_FOUND", "download unavailable", request_id_);
+        response.set(http::field::cache_control, "no-store");
+        Send(std::move(response));
+    }
+
+    void HandlePilotDownload(const nebulafs::http::HttpRequest& request, const std::string& token) {
+        const auto now = EpochSeconds();
+        const auto id = nebulafs::http::pilot_download::Verify(token, now, *pilot_download_key_);
+        const auto upload = id ? FindPilotDownload(*id, now) : std::nullopt;
+        if (!upload) {
+            return PilotDownloadNotFound(request);
+        }
+        try {
+            SendDownload(request, "pilot", upload->upload_id, upload->display_name);
+        } catch (const std::filesystem::filesystem_error& e) {
+            nebulafs::core::LogError("Could not read the verified file: " +
+                                     std::string(e.what()));
+            PilotDownloadNotFound(request);
+        }
+    }
+
+    void SendDownload(const nebulafs::http::HttpRequest& request, const std::string& bucket,
+                      const std::string& object, const std::string& display_name = {}) {
         auto storage_result = storage_->ReadObject(bucket, object);
         if (!storage_result.ok()) {
             auto response = ErrorResponse(http::status::not_found, request.version(),
@@ -637,7 +825,8 @@ private:
         }
 
         beast::error_code ec;
-        http::response<http::file_body> response{http::status::ok, request.version()};
+        http::response<http::basic_file_body<DownloadFile>> response{http::status::ok,
+                                                                    request.version()};
         response.body().open(storage_result.value().path.c_str(), beast::file_mode::scan, ec);
         if (ec) {
             auto err = ErrorResponse(http::status::internal_server_error, request.version(),
@@ -648,6 +837,22 @@ private:
         const auto size = response.body().size();
         response.set(http::field::content_type, "application/octet-stream");
         response.set(http::field::accept_ranges, "bytes");
+        if (!display_name.empty()) {
+            // Encode the sender-controlled filename before placing it in a response header.
+            constexpr std::string_view hex = "0123456789ABCDEF";
+            std::string disposition = "attachment; filename*=UTF-8''";
+            for (const auto ch : display_name) {
+                const auto byte = static_cast<unsigned char>(ch);
+                disposition.push_back('%');
+                disposition.push_back(hex[byte >> 4]);
+                disposition.push_back(hex[byte & 15]);
+            }
+            response.set(http::field::content_disposition, disposition);
+            response.set(http::field::cache_control, "private, no-store");
+            response.set("X-Content-Type-Options", "nosniff");
+            response.set("Referrer-Policy", "no-referrer");
+        }
+
 
         // Support HTTP Range for large object reads and resumable downloads.
         auto range_header = request[http::field::range];
@@ -660,6 +865,8 @@ private:
                 return Send(std::move(err));
             }
             response.result(http::status::partial_content);
+            // Bound the serializer as well as Content-Length for a closed byte range.
+            response.body().file().SetEnd(range->end + 1);
             response.body().seek(range->start, ec);
             if (ec) {
                 auto err = ErrorResponse(http::status::internal_server_error, request.version(),
@@ -687,7 +894,9 @@ private:
         const auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::steady_clock::now() - request_start_)
                                  .count();
-        nebulafs::core::LogRequest(request_id_, request_method_, request_target_, request_remote_,
+        nebulafs::core::LogRequest(request_id_, request_method_,
+                                   request_target_.starts_with("/d/") ? "/d/[redacted]" : request_target_,
+                                   request_remote_,
                                    response.result_int(), latency);
         nebulafs::observability::RecordRequest(response.result_int(), latency);
         auto sp = std::make_shared<http::response<Body>>(std::move(response));
@@ -756,6 +965,8 @@ private:
     std::shared_ptr<nebulafs::storage::StorageBackend> storage_;
     std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata_;
     std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier_;
+    std::shared_ptr<const std::string> pilot_upload_token_;
+    std::shared_ptr<const std::string> pilot_download_key_;
     std::shared_ptr<RateLimiter> rate_limiter_;
 
     std::string request_id_;
@@ -786,6 +997,8 @@ public:
              std::shared_ptr<nebulafs::storage::StorageBackend> storage,
              std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata,
              std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier,
+             std::shared_ptr<const std::string> pilot_upload_token,
+            std::shared_ptr<const std::string> pilot_download_key,
              std::shared_ptr<RateLimiter> rate_limiter,
              net::ssl::context* ssl_ctx)
         : acceptor_(ioc),
@@ -794,6 +1007,8 @@ public:
           storage_(std::move(storage)),
           metadata_(std::move(metadata)),
           auth_verifier_(std::move(auth_verifier)),
+          pilot_upload_token_(std::move(pilot_upload_token)),
+          pilot_download_key_(std::move(pilot_download_key)),
           rate_limiter_(std::move(rate_limiter)),
           ssl_ctx_(ssl_ctx) {
         beast::error_code ec;
@@ -819,13 +1034,13 @@ private:
                 auto stream = beast::ssl_stream<beast::tcp_stream>(std::move(socket), *ssl_ctx_);
                 std::make_shared<Session<beast::ssl_stream<beast::tcp_stream>>>(
                     std::move(stream), router_, config_, storage_, metadata_, auth_verifier_,
-                    rate_limiter_)
+                    pilot_upload_token_, pilot_download_key_, rate_limiter_)
                     ->Start();
             } else {
                 auto stream = beast::tcp_stream(std::move(socket));
                 std::make_shared<Session<beast::tcp_stream>>(std::move(stream), router_, config_,
                                                              storage_, metadata_, auth_verifier_,
-                                                             rate_limiter_)
+                                                             pilot_upload_token_, pilot_download_key_, rate_limiter_)
                     ->Start();
             }
         }
@@ -838,6 +1053,8 @@ private:
     std::shared_ptr<nebulafs::storage::StorageBackend> storage_;
     std::shared_ptr<nebulafs::metadata::MetadataBackend> metadata_;
     std::shared_ptr<nebulafs::auth::JwtVerifier> auth_verifier_;
+    std::shared_ptr<const std::string> pilot_upload_token_;
+    std::shared_ptr<const std::string> pilot_download_key_;
     std::shared_ptr<RateLimiter> rate_limiter_;
     net::ssl::context* ssl_ctx_{nullptr};
 };
@@ -855,6 +1072,25 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, const core::Config& config,
       storage_(std::move(storage)),
       metadata_(std::move(metadata)) {
     auth_verifier_ = std::make_shared<nebulafs::auth::JwtVerifier>(config_.auth);
+    if (const char* raw_token = std::getenv("NEBULAFS_PILOT_UPLOAD_TOKEN")) {
+        std::string token(raw_token);
+        if (token.size() != 64 || token.find_first_not_of("0123456789abcdefABCDEF") !=
+                                      std::string::npos ||
+            config_.server.mode != "single_node") {
+            throw std::invalid_argument(
+                "NEBULAFS_PILOT_UPLOAD_TOKEN requires a single-node server and 64 hex digits");
+        }
+        pilot_upload_token_ = std::make_shared<const std::string>(std::move(token));
+    }
+    if (const char* raw_key = std::getenv("NEBULAFS_PILOT_DOWNLOAD_KEY")) {
+        std::string key(raw_key);
+        if (!pilot_upload_token_ || key == *pilot_upload_token_ || key.size() != 64 ||
+            key.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+            throw std::invalid_argument(
+                "NEBULAFS_PILOT_DOWNLOAD_KEY requires an independent 64-digit hex key");
+        }
+        pilot_download_key_ = std::make_shared<const std::string>(std::move(key));
+    }
     if (config_.server.tls.enabled) {
         ssl_context_ = std::make_unique<net::ssl::context>(net::ssl::context::tlsv12_server);
         ssl_context_->use_certificate_chain_file(config_.server.tls.certificate);
@@ -871,7 +1107,7 @@ void HttpServer::Run() {
     const tcp::endpoint endpoint{address, static_cast<unsigned short>(config_.server.port)};
 
     std::make_shared<Listener>(ioc_, endpoint, router_, config_, storage_, metadata_,
-                               auth_verifier_, rate_limiter,
+                               auth_verifier_, pilot_upload_token_, pilot_download_key_, rate_limiter,
                                ssl_context_ ? ssl_context_.get() : nullptr)
         ->Run();
 }
@@ -894,16 +1130,50 @@ void HttpServer::ScheduleCleanupSweep() {
         if (ec) {
             return;
         }
-        RunCleanupSweep();
+        try {
+            RunCleanupSweep();
+        } catch (const std::exception& e) {
+            core::LogError("Cleanup sweep failed: " + std::string(e.what()));
+        }
         ScheduleCleanupSweep();
     });
 }
 
 void HttpServer::RunCleanupSweep() {
+    const auto sqlite = std::dynamic_pointer_cast<metadata::SqliteMetadataStore>(metadata_);
+    if (sqlite) {
+        try {
+            const auto completed = sqlite->ListExpiredVerifiedCompletions(
+                EpochSeconds() - kFileRetention, config_.cleanup.max_uploads_per_sweep);
+            for (const auto& id : completed) {
+                const std::lock_guard lock(sqlite->upload_mutex());
+                std::error_code ec;
+                std::filesystem::remove_all(std::filesystem::path(storage_->temp_path()) /
+                                                "multipart" / id, ec);
+                if (!ec) {
+                    std::filesystem::remove(storage::LocalStorage::BuildObjectPath(
+                                                storage_->base_path(), "pilot", id), ec);
+                }
+                if (ec) {
+                    core::LogError("Could not remove expired verified file: " + ec.message());
+                    continue;
+                }
+                sqlite->DeleteExpiredVerifiedCompletion(id);
+            }
+        } catch (const std::exception& e) {
+            core::LogError("Verified file retention sweep failed: " + std::string(e.what()));
+        }
+    }
     const auto cutoff = nebulafs::core::NowIso8601WithOffsetSeconds(
         -config_.cleanup.grace_period_seconds);
-    auto expired = metadata_->ListExpiredMultipartUploads(
-        cutoff, config_.cleanup.max_uploads_per_sweep);
+    auto expired = [&] {
+        std::unique_lock<std::mutex> upload_lock;
+        if (sqlite) {
+            upload_lock = std::unique_lock(sqlite->upload_mutex());
+        }
+        return metadata_->ListExpiredMultipartUploads(cutoff,
+                                                      config_.cleanup.max_uploads_per_sweep);
+    }();
     if (!expired.ok()) {
         nebulafs::core::LogError("Cleanup sweep failed to list uploads: " +
                                  expired.error().message);
@@ -911,6 +1181,31 @@ void HttpServer::RunCleanupSweep() {
     }
 
     for (const auto& upload : expired.value()) {
+        std::unique_lock<std::mutex> upload_lock;
+        if (sqlite) {
+            upload_lock = std::unique_lock(sqlite->upload_mutex());
+            const auto current = metadata_->GetMultipartUpload(upload.upload_id);
+            if (!current.ok() || current.value().expires_at >= cutoff ||
+                (current.value().state != "initiated" && current.value().state != "uploading")) {
+                continue;
+            }
+            if (sqlite->GetVerifiedUpload("pilot", upload.upload_id).ok()) {
+                std::error_code ec;
+                const auto staging = std::filesystem::path(storage_->temp_path()) /
+                                     "multipart" / upload.upload_id;
+                std::filesystem::remove_all(staging, ec);
+                if (ec) {
+                    core::LogError("Could not remove expired verified staging: " + ec.message());
+                    continue;
+                }
+                const auto removed = sqlite->DeleteMultipartUpload(upload.upload_id);
+                if (!removed.ok()) {
+                    core::LogError("Could not remove expired verified upload metadata: " +
+                                   removed.error().message);
+                }
+                continue;
+            }
+        }
         bool upload_success = true;
         if (config_.server.mode == "distributed") {
             auto parts = metadata_->ListMultipartParts(upload.upload_id);

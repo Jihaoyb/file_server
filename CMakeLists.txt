@@ -11,6 +11,16 @@ find_package(Boost REQUIRED COMPONENTS system)
 find_package(OpenSSL REQUIRED)
 find_package(Poco REQUIRED COMPONENTS Foundation Util JSON Crypto Data DataSQLite Net NetSSL)
 
+set(PILOT_WEB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/web/pilot")
+set(PILOT_WEB_ASSETS index.html styles.css app.js sha256.js sha256-worker.js)
+set(PILOT_WEB_VARIABLES PILOT_HTML PILOT_CSS PILOT_JS PILOT_SHA256 PILOT_WORKER)
+foreach(asset variable IN ZIP_LISTS PILOT_WEB_ASSETS PILOT_WEB_VARIABLES)
+    set(asset_path "${PILOT_WEB_DIR}/${asset}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${asset_path}")
+    file(READ "${asset_path}" "${variable}")
+endforeach()
+configure_file("${PILOT_WEB_DIR}/assets.h.in" generated/pilot_web_assets.h @ONLY)
+
 add_library(nebulafs_core
     src/distributed/http_client.cpp
     src/distributed/placement_token.cpp
@@ -22,6 +32,8 @@ add_library(nebulafs_core
     src/core/result.cpp
     src/core/ids.cpp
     src/core/time.cpp
+    src/metadata/verified_upload.cpp
+    src/http/verified_multipart.cpp
     src/metadata/sqlite_metadata_store.cpp
     src/metadata/remote_metadata_store.cpp
     src/storage/local_storage.cpp
@@ -35,6 +47,8 @@ add_library(nebulafs_core
 target_include_directories(nebulafs_core
     PUBLIC
         include
+    PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 
 target_link_libraries(nebulafs_core
